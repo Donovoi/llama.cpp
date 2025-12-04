@@ -58,8 +58,8 @@ struct ggml_backend_rpc_split_buffer_context {
 };
 
 // Calculate row split for a given endpoint
-static void rpc_split_get_row_split(int64_t * row_low, int64_t * row_high, 
-                                    int64_t nrows, const float * tensor_split, 
+static void rpc_split_get_row_split(int64_t * row_low, int64_t * row_high,
+                                    int64_t nrows, const float * tensor_split,
                                     int n_endpoints, int endpoint_id) {
     // Calculate cumulative split proportions
     float sum = 0.0f;
@@ -73,14 +73,14 @@ static void rpc_split_get_row_split(int64_t * row_low, int64_t * row_high,
             // Use 1.0f for each since we're recalculating
         }
     }
-    
+
     float cumulative = 0.0f;
     for (int i = 0; i < endpoint_id; i++) {
         cumulative += tensor_split[i] / sum;
     }
-    
+
     *row_low = (int64_t)(nrows * cumulative);
-    
+
     if (endpoint_id == n_endpoints - 1) {
         *row_high = nrows;
     } else {
@@ -109,73 +109,73 @@ static void * ggml_backend_rpc_split_buffer_get_base(ggml_backend_buffer_t buffe
 
 static enum ggml_status ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     GGML_ASSERT(tensor->view_src == nullptr && "views of split tensors are not supported");
-    
+
     ggml_backend_rpc_split_buffer_context * ctx = (ggml_backend_rpc_split_buffer_context *)buffer->context;
-    
+
     ggml_backend_rpc_split_tensor_extra * extra = new ggml_backend_rpc_split_tensor_extra{};
     ctx->tensor_extras.push_back(extra);
     extra->n_endpoints = ctx->n_endpoints;
-    
+
     // Determine if this is an expert tensor that should use expert-based splitting
     const bool use_expert_split = rpc_split_is_expert_tensor(tensor);
     extra->is_expert_split = use_expert_split;
-    
+
     const int64_t n_expert = tensor->ne[2];  // For expert tensors: [embd, ff, n_expert]
     const int64_t nrows = ggml_nrows(tensor);
-    
-    LOG_DBG("[%s] %s: expert_split=%d, ne=[%ld,%ld,%ld,%ld]\n", 
-            __func__, tensor->name, use_expert_split, 
+
+    LOG_DBG("[%s] %s: expert_split=%d, ne=[%ld,%ld,%ld,%ld]\n",
+            __func__, tensor->name, use_expert_split,
             tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
-    
+
     // Allocate memory on each endpoint for its portion of the tensor
     for (int i = 0; i < ctx->n_endpoints; i++) {
         int64_t split_low, split_high;
         int64_t split_dim_size;
         size_t size;
-        
+
         if (use_expert_split) {
             // Expert-based split: each endpoint gets complete experts
-            rpc_split_get_expert_range(&split_low, &split_high, n_expert, 
+            rpc_split_get_expert_range(&split_low, &split_high, n_expert,
                                        ctx->tensor_split.data(), ctx->n_endpoints, i);
             extra->expert_low[i] = split_low;
             extra->expert_high[i] = split_high;
             extra->row_low[i] = 0;
             extra->row_high[i] = 0;
-            
+
             split_dim_size = split_high - split_low;
             if (split_dim_size == 0) {
                 extra->remote_ptrs[i] = 0;
                 continue;
             }
-            
+
             // Size = elements per expert * number of experts * element size
             size_t elements_per_expert = tensor->ne[0] * tensor->ne[1];
             size = split_dim_size * elements_per_expert * ggml_type_size(tensor->type) / ggml_blck_size(tensor->type);
-            
-            LOG_DBG("[%s] endpoint %d: experts %ld-%ld (%ld experts), size=%zu bytes\n", 
+
+            LOG_DBG("[%s] endpoint %d: experts %ld-%ld (%ld experts), size=%zu bytes\n",
                     __func__, i, split_low, split_high - 1, split_dim_size, size);
         } else {
             // Row-based split: distribute rows across endpoints
-            rpc_split_get_row_split(&split_low, &split_high, nrows, 
+            rpc_split_get_row_split(&split_low, &split_high, nrows,
                                     ctx->tensor_split.data(), ctx->n_endpoints, i);
             extra->row_low[i] = split_low;
             extra->row_high[i] = split_high;
             extra->expert_low[i] = 0;
             extra->expert_high[i] = 0;
-            
+
             split_dim_size = split_high - split_low;
             if (split_dim_size == 0) {
                 extra->remote_ptrs[i] = 0;
                 continue;
             }
-            
+
             // Size = rows * row_size
             size = split_dim_size * ggml_row_size(tensor->type, tensor->ne[0]);
-            
-            LOG_DBG("[%s] endpoint %d: rows %ld-%ld (%ld rows), size=%zu bytes\n", 
+
+            LOG_DBG("[%s] endpoint %d: rows %ld-%ld (%ld rows), size=%zu bytes\n",
                     __func__, i, split_low, split_high - 1, split_dim_size, size);
         }
-        
+
         // Get socket for this endpoint
         auto sock = ctx->sockets[i];
         if (sock == nullptr) {
@@ -183,7 +183,7 @@ static enum ggml_status ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_b
             return GGML_STATUS_FAILED;
         }
         extra->sockets[i] = sock;
-        
+
         // Allocate buffer on remote endpoint
         rpc_msg_alloc_buffer_req request = {ctx->devices[i], size};
         rpc_msg_alloc_buffer_rsp response;
@@ -192,43 +192,43 @@ static enum ggml_status ggml_backend_rpc_split_buffer_init_tensor(ggml_backend_b
             GGML_LOG_ERROR("RPC split buffer: failed to allocate %zu bytes on endpoint %d\n", size, i);
             return GGML_STATUS_FAILED;
         }
-        
+
         extra->remote_ptrs[i] = response.remote_ptr;
     }
-    
+
     tensor->extra = extra;
     return GGML_STATUS_SUCCESS;
 }
 
-static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, 
+static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
                                                      const void * data, size_t offset, size_t size) {
     // For split tensors, we need to distribute the data across endpoints
     // This expects the full tensor data, starting at offset
     GGML_ASSERT(offset == 0 && "split tensors must be set from offset 0");
     GGML_ASSERT(size == ggml_nbytes(tensor) && "split tensors must be set in their entirety");
-    
+
     ggml_backend_rpc_split_tensor_extra * extra = (ggml_backend_rpc_split_tensor_extra *)tensor->extra;
     GGML_ASSERT(extra != nullptr);
-    
+
     const uint8_t * src = (const uint8_t *)data;
-    
+
     if (extra->is_expert_split) {
         // Expert-based split: send complete experts to each endpoint
         // Tensor shape is [ne0, ne1, n_expert] = [embd, ff, n_expert]
         const size_t expert_size = tensor->ne[0] * tensor->ne[1] * ggml_type_size(tensor->type) / ggml_blck_size(tensor->type);
-        
+
         for (int i = 0; i < extra->n_endpoints; i++) {
             if (extra->remote_ptrs[i] == 0) {
                 continue; // No experts on this endpoint
             }
-            
+
             int64_t expert_low = extra->expert_low[i];
             int64_t expert_high = extra->expert_high[i];
             int64_t n_experts_split = expert_high - expert_low;
-            
+
             size_t split_offset = expert_low * expert_size;
             size_t split_size = n_experts_split * expert_size;
-            
+
             // Create tensor descriptor for this endpoint's experts
             rpc_tensor rpc_tensor_desc;
             memset(&rpc_tensor_desc, 0, sizeof(rpc_tensor_desc));
@@ -245,7 +245,7 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
             rpc_tensor_desc.nb[3] = rpc_tensor_desc.nb[2] * n_experts_split;
             rpc_tensor_desc.data = extra->remote_ptrs[i];
             snprintf(rpc_tensor_desc.name, GGML_MAX_NAME, "%.50s_e%d", tensor->name, i);
-            
+
             // Send the experts to this endpoint
             size_t input_size = sizeof(rpc_tensor_desc) + sizeof(uint64_t) + split_size;
             std::vector<uint8_t> input(input_size, 0);
@@ -253,29 +253,29 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
             memcpy(input.data(), &rpc_tensor_desc, sizeof(rpc_tensor_desc));
             memcpy(input.data() + sizeof(rpc_tensor_desc), &wire_offset, sizeof(wire_offset));
             memcpy(input.data() + sizeof(rpc_tensor_desc) + sizeof(wire_offset), src + split_offset, split_size);
-            
+
             bool status = send_rpc_cmd(extra->sockets[i], RPC_CMD_SET_TENSOR, input.data(), input.size());
             RPC_STATUS_ASSERT(status);
-            
-            LOG_DBG("[%s] endpoint %d: set %zu bytes for experts %ld-%ld\n", 
+
+            LOG_DBG("[%s] endpoint %d: set %zu bytes for experts %ld-%ld\n",
                     __func__, i, split_size, expert_low, expert_high - 1);
         }
     } else {
         // Row-based split: original implementation
         const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
-        
+
         for (int i = 0; i < extra->n_endpoints; i++) {
             if (extra->remote_ptrs[i] == 0) {
                 continue; // No rows on this endpoint
             }
-            
+
             int64_t row_low = extra->row_low[i];
             int64_t row_high = extra->row_high[i];
             int64_t nrows_split = row_high - row_low;
-            
+
             size_t split_offset = row_low * row_size;
             size_t split_size = nrows_split * row_size;
-            
+
             // Create a temporary tensor descriptor for this slice
             rpc_tensor rpc_tensor_desc;
             memset(&rpc_tensor_desc, 0, sizeof(rpc_tensor_desc));
@@ -291,7 +291,7 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
             rpc_tensor_desc.nb[1] = row_size;
             rpc_tensor_desc.data = extra->remote_ptrs[i];
             snprintf(rpc_tensor_desc.name, GGML_MAX_NAME, "%.50s_s%d", tensor->name, i);
-            
+
             // Send the data slice to this endpoint
             size_t input_size = sizeof(rpc_tensor_desc) + sizeof(uint64_t) + split_size;
             std::vector<uint8_t> input(input_size, 0);
@@ -299,45 +299,45 @@ static void ggml_backend_rpc_split_buffer_set_tensor(ggml_backend_buffer_t buffe
             memcpy(input.data(), &rpc_tensor_desc, sizeof(rpc_tensor_desc));
             memcpy(input.data() + sizeof(rpc_tensor_desc), &wire_offset, sizeof(wire_offset));
             memcpy(input.data() + sizeof(rpc_tensor_desc) + sizeof(wire_offset), src + split_offset, split_size);
-            
+
             bool status = send_rpc_cmd(extra->sockets[i], RPC_CMD_SET_TENSOR, input.data(), input.size());
             RPC_STATUS_ASSERT(status);
-            
-            LOG_DBG("[%s] endpoint %d: set %zu bytes for rows %ld-%ld\n", 
+
+            LOG_DBG("[%s] endpoint %d: set %zu bytes for rows %ld-%ld\n",
                     __func__, i, split_size, row_low, row_high);
         }
     }
-    
+
     GGML_UNUSED(buffer);
 }
 
-static void ggml_backend_rpc_split_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, 
+static void ggml_backend_rpc_split_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
                                                      void * data, size_t offset, size_t size) {
     // Gather data from all endpoints back into the full tensor
     GGML_ASSERT(offset == 0 && "split tensors must be read from offset 0");
     GGML_ASSERT(size == ggml_nbytes(tensor) && "split tensors must be read in their entirety");
-    
+
     ggml_backend_rpc_split_tensor_extra * extra = (ggml_backend_rpc_split_tensor_extra *)tensor->extra;
     GGML_ASSERT(extra != nullptr);
-    
+
     uint8_t * dst = (uint8_t *)data;
-    
+
     if (extra->is_expert_split) {
         // Expert-based split: gather complete experts from each endpoint
         const size_t expert_size = tensor->ne[0] * tensor->ne[1] * ggml_type_size(tensor->type) / ggml_blck_size(tensor->type);
-        
+
         for (int i = 0; i < extra->n_endpoints; i++) {
             if (extra->remote_ptrs[i] == 0) {
                 continue;
             }
-            
+
             int64_t expert_low = extra->expert_low[i];
             int64_t expert_high = extra->expert_high[i];
             int64_t n_experts_split = expert_high - expert_low;
-            
+
             size_t split_offset = expert_low * expert_size;
             size_t split_size = n_experts_split * expert_size;
-            
+
             // Create tensor descriptor for request
             rpc_tensor rpc_tensor_desc;
             memset(&rpc_tensor_desc, 0, sizeof(rpc_tensor_desc));
@@ -349,32 +349,32 @@ static void ggml_backend_rpc_split_buffer_get_tensor(ggml_backend_buffer_t buffe
             rpc_tensor_desc.ne[2] = n_experts_split;
             rpc_tensor_desc.ne[3] = 1;
             rpc_tensor_desc.data = extra->remote_ptrs[i];
-            
+
             rpc_msg_get_tensor_req request;
             request.tensor = rpc_tensor_desc;
             request.offset = 0;
             request.size = split_size;
-            
-            bool status = send_rpc_cmd(extra->sockets[i], RPC_CMD_GET_TENSOR, &request, sizeof(request), 
+
+            bool status = send_rpc_cmd(extra->sockets[i], RPC_CMD_GET_TENSOR, &request, sizeof(request),
                                        dst + split_offset, split_size);
             RPC_STATUS_ASSERT(status);
         }
     } else {
         // Row-based split: original implementation
         const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
-        
+
         for (int i = 0; i < extra->n_endpoints; i++) {
             if (extra->remote_ptrs[i] == 0) {
                 continue;
             }
-            
+
             int64_t row_low = extra->row_low[i];
             int64_t row_high = extra->row_high[i];
             int64_t nrows_split = row_high - row_low;
-            
+
             size_t split_offset = row_low * row_size;
             size_t split_size = nrows_split * row_size;
-            
+
             // Create tensor descriptor for request
             rpc_tensor rpc_tensor_desc;
             memset(&rpc_tensor_desc, 0, sizeof(rpc_tensor_desc));
@@ -387,29 +387,29 @@ static void ggml_backend_rpc_split_buffer_get_tensor(ggml_backend_buffer_t buffe
                 rpc_tensor_desc.ne[d] = 1;
             }
             rpc_tensor_desc.data = extra->remote_ptrs[i];
-            
+
             rpc_msg_get_tensor_req request;
             request.tensor = rpc_tensor_desc;
             request.offset = 0;
             request.size = split_size;
-            
-            bool status = send_rpc_cmd(extra->sockets[i], RPC_CMD_GET_TENSOR, &request, sizeof(request), 
+
+            bool status = send_rpc_cmd(extra->sockets[i], RPC_CMD_GET_TENSOR, &request, sizeof(request),
                                        dst + split_offset, split_size);
             RPC_STATUS_ASSERT(status);
         }
     }
-    
+
     GGML_UNUSED(buffer);
 }
 
 static void ggml_backend_rpc_split_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_split_buffer_context * ctx = (ggml_backend_rpc_split_buffer_context *)buffer->context;
-    
+
     // Clear all remote buffers
     for (auto * extra : ctx->tensor_extras) {
         for (int i = 0; i < extra->n_endpoints; i++) {
             if (extra->remote_ptrs[i] == 0) continue;
-            
+
             rpc_msg_buffer_clear_req request = {extra->remote_ptrs[i], value};
             bool status = send_rpc_cmd(extra->sockets[i], RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
             RPC_STATUS_ASSERT(status);
@@ -437,13 +437,13 @@ static const char * ggml_backend_rpc_split_buffer_type_name(ggml_backend_buffer_
 
 static ggml_backend_buffer_t ggml_backend_rpc_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_split_buffer_type_context * buft_ctx = (ggml_backend_rpc_split_buffer_type_context *)buft->context;
-    
+
     ggml_backend_rpc_split_buffer_context * ctx = new ggml_backend_rpc_split_buffer_context{};
     ctx->n_endpoints = buft_ctx->n_endpoints;
     ctx->endpoints = buft_ctx->endpoints;
     ctx->devices = buft_ctx->devices;
     ctx->tensor_split = buft_ctx->tensor_split;
-    
+
     // Establish connections to all endpoints
     for (int i = 0; i < ctx->n_endpoints; i++) {
         auto sock = get_socket(ctx->endpoints[i].c_str());
@@ -454,14 +454,14 @@ static ggml_backend_buffer_t ggml_backend_rpc_split_buffer_type_alloc_buffer(ggm
         }
         ctx->sockets.push_back(sock);
     }
-    
+
     return ggml_backend_buffer_init(buft, ggml_backend_rpc_split_buffer_interface, ctx, size);
 }
 
 static size_t ggml_backend_rpc_split_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     // Return maximum alignment required by any endpoint
     ggml_backend_rpc_split_buffer_type_context * ctx = (ggml_backend_rpc_split_buffer_type_context *)buft->context;
-    
+
     size_t max_alignment = 1;
     for (int i = 0; i < ctx->n_endpoints; i++) {
         auto sock = get_socket(ctx->endpoints[i].c_str());
@@ -495,15 +495,15 @@ bool ggml_backend_buft_is_rpc_split(ggml_backend_buffer_type_t buft) {
 // Create an RPC split buffer type
 ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(
         const char ** endpoints, const uint32_t * devices, const float * tensor_split, int n_endpoints) {
-    
+
     if (n_endpoints <= 0 || n_endpoints > GGML_RPC_SPLIT_MAX_ENDPOINTS) {
         GGML_LOG_ERROR("RPC split buffer: invalid number of endpoints: %d\n", n_endpoints);
         return nullptr;
     }
-    
+
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    
+
     // Build a unique name for this split configuration
     std::string buft_name = "RPC_SPLIT[";
     for (int i = 0; i < n_endpoints; i++) {
@@ -511,22 +511,22 @@ ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(
         buft_name += std::string(endpoints[i]) + ":" + std::to_string(devices[i]);
     }
     buft_name += "]";
-    
+
     // Check if we already have this buffer type
     static std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_map;
     auto it = buft_map.find(buft_name);
     if (it != buft_map.end()) {
         return it->second;
     }
-    
+
     // Note: We don't verify endpoint connectivity here since it can abort on failure.
     // Connectivity will be verified when the buffer is actually allocated.
-    
+
     // Create the context
     ggml_backend_rpc_split_buffer_type_context * ctx = new ggml_backend_rpc_split_buffer_type_context{};
     ctx->n_endpoints = n_endpoints;
     ctx->name = buft_name;
-    
+
     float split_sum = 0.0f;
     for (int i = 0; i < n_endpoints; i++) {
         ctx->endpoints.push_back(endpoints[i]);
@@ -534,23 +534,23 @@ ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(
         ctx->tensor_split[i] = tensor_split ? tensor_split[i] : 1.0f;
         split_sum += ctx->tensor_split[i];
     }
-    
+
     // Normalize tensor_split if needed
     if (split_sum > 0 && std::abs(split_sum - 1.0f) > 0.01f) {
         for (int i = 0; i < n_endpoints; i++) {
             ctx->tensor_split[i] /= split_sum;
         }
     }
-    
+
     // Create the buffer type
     ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
         /* .iface   = */ ggml_backend_rpc_split_buffer_type_interface,
         /* .device  = */ nullptr, // Split buffer doesn't belong to a single device
         /* .context = */ ctx
     };
-    
+
     buft_map[buft_name] = buft;
-    
+
     GGML_LOG_INFO("RPC split buffer type created: %s\n", buft_name.c_str());
     return buft;
 }
@@ -572,21 +572,21 @@ static void rpc_split_get_expert_range(int64_t * expert_low, int64_t * expert_hi
     if (sum == 0.0f) {
         sum = (float)n_endpoints;
     }
-    
+
     float cumulative = 0.0f;
     for (int i = 0; i < endpoint_id; i++) {
         cumulative += tensor_split[i] / sum;
     }
-    
+
     *expert_low = (int64_t)(n_expert * cumulative);
-    
+
     if (endpoint_id == n_endpoints - 1) {
         *expert_high = n_expert;
     } else {
         cumulative += tensor_split[endpoint_id] / sum;
         *expert_high = (int64_t)(n_expert * cumulative);
     }
-    
+
     // Ensure at least one expert per endpoint if possible
     if (*expert_high == *expert_low && endpoint_id < n_endpoints - 1 && *expert_low < n_expert) {
         *expert_high = *expert_low + 1;
@@ -594,7 +594,7 @@ static void rpc_split_get_expert_range(int64_t * expert_low, int64_t * expert_hi
 }
 
 // Get the endpoint that owns a specific expert ID
-static int rpc_split_get_expert_endpoint(int64_t expert_id, int64_t n_expert, 
+static int rpc_split_get_expert_endpoint(int64_t expert_id, int64_t n_expert,
                                          const float * tensor_split, int n_endpoints) {
     for (int i = 0; i < n_endpoints; i++) {
         int64_t expert_low, expert_high;
@@ -614,13 +614,13 @@ static bool rpc_split_is_expert_tensor(const ggml_tensor * tensor) {
     if (ggml_n_dims(tensor) < 3 || tensor->ne[2] <= 1) {
         return false;
     }
-    
+
     // Check name pattern: blk.N.ffn_*_exps
     const char * name = tensor->name;
     if (name == nullptr) {
         return false;
     }
-    
+
     return (strstr(name, "ffn_gate_exps") != nullptr ||
             strstr(name, "ffn_up_exps") != nullptr ||
             strstr(name, "ffn_down_exps") != nullptr);
@@ -652,52 +652,52 @@ static bool rpc_split_mul_mat_id(
         const ggml_tensor * ids_tensor,
         ggml_tensor * output,
         rpc_split_mul_mat_id_stats * stats = nullptr) {
-    
+
     // Verify as_tensor is a split tensor
-    ggml_backend_rpc_split_tensor_extra * extra = 
+    ggml_backend_rpc_split_tensor_extra * extra =
         (ggml_backend_rpc_split_tensor_extra *)as_tensor->extra;
     if (extra == nullptr || !extra->is_expert_split) {
         GGML_LOG_ERROR("[%s] as_tensor is not an expert-split tensor\n", __func__);
         return false;
     }
-    
+
     auto start = std::chrono::high_resolution_clock::now();
-    
+
     const int n_endpoints = extra->n_endpoints;
     const int64_t n_expert = as_tensor->ne[2];
-    
+
     // Prepare b tensor data to send to all endpoints
     size_t b_size = ggml_nbytes(b_tensor);
     std::vector<uint8_t> b_data(b_size);
     // For split buffer orchestration, we need to gather b from host memory
     // In production, b_tensor would be a CPU tensor or we'd have a copy
     memcpy(b_data.data(), b_tensor->data, b_size);
-    
+
     // Prepare ids tensor data
     size_t ids_size = ggml_nbytes(ids_tensor);
     std::vector<uint8_t> ids_data(ids_size);
     memcpy(ids_data.data(), ids_tensor->data, ids_size);
-    
+
     // Prepare output accumulator (zero-initialized)
     size_t output_size = ggml_nbytes(output);
     std::vector<float> output_accum(output_size / sizeof(float), 0.0f);
-    
+
     // Send requests to all endpoints in parallel (simplified: sequential here)
     // TODO: Use async I/O for true parallelism
     int endpoints_used = 0;
-    
+
     for (int i = 0; i < n_endpoints; i++) {
         if (extra->remote_ptrs[i] == 0) {
             continue;  // No experts on this endpoint
         }
-        
+
         int64_t expert_low = extra->expert_low[i];
         int64_t expert_high = extra->expert_high[i];
-        
+
         // Build request
         rpc_msg_mul_mat_id_partial_req request;
         memset(&request, 0, sizeof(request));
-        
+
         // as tensor descriptor (local portion on this endpoint)
         request.as.id = (uint64_t)as_tensor;
         request.as.type = as_tensor->type;
@@ -708,104 +708,104 @@ static bool rpc_split_mul_mat_id(
         request.as.ne[3] = 1;
         request.as.data = extra->remote_ptrs[i];
         snprintf(request.as.name, GGML_MAX_NAME, "%.50s_e%d", as_tensor->name, i);
-        
+
         // b tensor descriptor (full)
         request.b.type = b_tensor->type;
         for (int d = 0; d < GGML_MAX_DIMS; d++) {
             request.b.ne[d] = b_tensor->ne[d];
         }
-        
+
         // ids tensor descriptor (full)
         request.ids.type = ids_tensor->type;
         for (int d = 0; d < GGML_MAX_DIMS; d++) {
             request.ids.ne[d] = ids_tensor->ne[d];
         }
-        
+
         // output tensor descriptor
         request.output.type = output->type;
         for (int d = 0; d < GGML_MAX_DIMS; d++) {
             request.output.ne[d] = output->ne[d];
         }
-        
+
         request.expert_low = expert_low;
         request.expert_high = expert_high;
         request.device = 0;  // TODO: Get from endpoint context
-        
+
         // Send request and data
         auto sock = extra->sockets[i];
         if (sock == nullptr) {
             GGML_LOG_ERROR("[%s] no socket for endpoint %d\n", __func__, i);
             continue;
         }
-        
+
         bool status = send_rpc_cmd(sock, RPC_CMD_MUL_MAT_ID_PARTIAL, &request, sizeof(request));
         if (!status) {
             GGML_LOG_ERROR("[%s] failed to send request to endpoint %d\n", __func__, i);
             continue;
         }
-        
+
         // Send b tensor data
         if (!send_data(sock->fd, b_data.data(), b_data.size())) {
             GGML_LOG_ERROR("[%s] failed to send b data to endpoint %d\n", __func__, i);
             continue;
         }
-        
+
         // Send ids tensor data
         if (!send_data(sock->fd, ids_data.data(), ids_data.size())) {
             GGML_LOG_ERROR("[%s] failed to send ids data to endpoint %d\n", __func__, i);
             continue;
         }
-        
+
         // Receive response
         rpc_msg_mul_mat_id_partial_rsp response;
         if (!recv_data(sock->fd, &response, sizeof(response))) {
             GGML_LOG_ERROR("[%s] failed to receive response from endpoint %d\n", __func__, i);
             continue;
         }
-        
+
         if (!response.success) {
             GGML_LOG_ERROR("[%s] computation failed on endpoint %d\n", __func__, i);
             continue;
         }
-        
+
         // Receive partial output and accumulate
         std::vector<float> partial_output(output_size / sizeof(float));
         if (!recv_data(sock->fd, partial_output.data(), output_size)) {
             GGML_LOG_ERROR("[%s] failed to receive output from endpoint %d\n", __func__, i);
             continue;
         }
-        
+
         // Accumulate partial results
         for (size_t j = 0; j < partial_output.size(); j++) {
             output_accum[j] += partial_output[j];
         }
-        
+
         // Record statistics
         if (stats) {
             stats->compute_us[i] = response.compute_us;
             stats->experts_computed[i] = expert_high - expert_low;
         }
-        
+
         endpoints_used++;
-        
-        LOG_DBG("[%s] endpoint %d: experts %ld-%ld, compute_us=%lu\n", 
+
+        LOG_DBG("[%s] endpoint %d: experts %ld-%ld, compute_us=%lu\n",
                 __func__, i, expert_low, expert_high - 1, response.compute_us);
     }
-    
+
     // Copy accumulated output to result tensor
     memcpy(output->data, output_accum.data(), output_size);
-    
+
     auto end = std::chrono::high_resolution_clock::now();
-    
+
     if (stats) {
         stats->total_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
         stats->endpoints_used = endpoints_used;
     }
-    
-    LOG_DBG("[%s] distributed MUL_MAT_ID complete: %d endpoints, %lu us total\n", 
-            __func__, endpoints_used, 
+
+    LOG_DBG("[%s] distributed MUL_MAT_ID complete: %d endpoints, %lu us total\n",
+            __func__, endpoints_used,
             std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-    
+
     return endpoints_used > 0;
 }
 
@@ -815,10 +815,10 @@ static bool rpc_split_can_distribute_mul_mat_id(const ggml_tensor * as_tensor) {
     if (as_tensor == nullptr || as_tensor->extra == nullptr) {
         return false;
     }
-    
-    ggml_backend_rpc_split_tensor_extra * extra = 
+
+    ggml_backend_rpc_split_tensor_extra * extra =
         (ggml_backend_rpc_split_tensor_extra *)as_tensor->extra;
-    
+
     return extra->is_expert_split && extra->n_endpoints > 1;
 }
 
@@ -851,40 +851,40 @@ struct rpc_split_profile_stats {
         int64_t activation_count;       // Times this endpoint was activated
     };
     std::array<endpoint_stats, GGML_RPC_SPLIT_MAX_ENDPOINTS> endpoints;
-    
+
     // Global statistics
     uint64_t total_operations;          // Number of distributed operations
     uint64_t total_time_us;             // Total time across all operations
     uint64_t min_operation_us;          // Fastest operation
     uint64_t max_operation_us;          // Slowest operation
-    
+
     // Expert activation frequency (for load balancing analysis)
     std::unordered_map<int64_t, int64_t> expert_activation_count;
-    
-    rpc_split_profile_stats() : total_operations(0), total_time_us(0), 
+
+    rpc_split_profile_stats() : total_operations(0), total_time_us(0),
                                  min_operation_us(UINT64_MAX), max_operation_us(0) {
         for (auto & ep : endpoints) {
             memset(&ep, 0, sizeof(ep));
         }
     }
-    
-    void record_operation(const rpc_split_profile_entry & entry, 
+
+    void record_operation(const rpc_split_profile_entry & entry,
                           const int32_t * ids, size_t ids_count) {
         total_operations++;
         total_time_us += entry.total_time_us;
         min_operation_us = std::min(min_operation_us, entry.total_time_us);
         max_operation_us = std::max(max_operation_us, entry.total_time_us);
-        
+
         // Track expert activations
         for (size_t i = 0; i < ids_count; i++) {
             expert_activation_count[ids[i]]++;
         }
     }
-    
+
     void record_endpoint(int endpoint_id, uint64_t compute_us, uint64_t network_us,
                          size_t bytes_sent, size_t bytes_received, int64_t experts) {
         if (endpoint_id < 0 || endpoint_id >= GGML_RPC_SPLIT_MAX_ENDPOINTS) return;
-        
+
         auto & ep = endpoints[endpoint_id];
         ep.total_compute_us += compute_us;
         ep.total_network_us += network_us;
@@ -893,11 +893,11 @@ struct rpc_split_profile_stats {
         ep.total_experts_computed += experts;
         ep.activation_count++;
     }
-    
+
     // Get load balance factor: 1.0 = perfectly balanced, < 1.0 = imbalanced
     float get_load_balance(int n_endpoints) const {
         if (n_endpoints <= 1) return 1.0f;
-        
+
         // Calculate coefficient of variation of compute times
         float sum = 0, sum_sq = 0;
         int active = 0;
@@ -909,18 +909,18 @@ struct rpc_split_profile_stats {
                 active++;
             }
         }
-        
+
         if (active <= 1) return 1.0f;
-        
+
         float mean = sum / active;
         float variance = (sum_sq / active) - (mean * mean);
         float stddev = sqrtf(variance);
         float cv = stddev / mean;  // Coefficient of variation
-        
+
         // Convert CV to balance factor: CV=0 -> 1.0, CV=1 -> 0.5, etc.
         return 1.0f / (1.0f + cv);
     }
-    
+
     // Print summary statistics
     void print_summary(int n_endpoints) const {
         printf("\n=== RPC Split Profiling Summary ===\n\n");
@@ -929,15 +929,15 @@ struct rpc_split_profile_stats {
         printf("Avg time: %.2f ms\n", total_operations > 0 ? (total_time_us / total_operations) / 1000.0 : 0);
         printf("Min/Max: %.2f / %.2f ms\n", min_operation_us / 1000.0, max_operation_us / 1000.0);
         printf("Load balance: %.1f%%\n\n", get_load_balance(n_endpoints) * 100);
-        
+
         printf("Per-endpoint statistics:\n");
         for (int i = 0; i < n_endpoints; i++) {
             const auto & ep = endpoints[i];
             if (ep.activation_count == 0) continue;
-            
+
             printf("  Endpoint %d:\n", i);
             printf("    Activations: %ld\n", ep.activation_count);
-            printf("    Compute: %.2f ms (%.1f%%)\n", 
+            printf("    Compute: %.2f ms (%.1f%%)\n",
                    ep.total_compute_us / 1000.0,
                    total_time_us > 0 ? (ep.total_compute_us * 100.0 / total_time_us) : 0);
             printf("    Network: %.2f ms\n", ep.total_network_us / 1000.0);
@@ -945,7 +945,7 @@ struct rpc_split_profile_stats {
             printf("    Data recv: %.2f MB\n", ep.total_bytes_received / (1024.0 * 1024.0));
             printf("    Experts computed: %ld\n", ep.total_experts_computed);
         }
-        
+
         // Print top activated experts
         if (!expert_activation_count.empty()) {
             printf("\nTop 10 most activated experts:\n");
@@ -953,9 +953,9 @@ struct rpc_split_profile_stats {
                 expert_activation_count.begin(), expert_activation_count.end());
             std::sort(sorted_experts.begin(), sorted_experts.end(),
                      [](const auto & a, const auto & b) { return a.second > b.second; });
-            
+
             for (size_t i = 0; i < std::min(sorted_experts.size(), (size_t)10); i++) {
-                printf("  Expert %ld: %ld activations\n", 
+                printf("  Expert %ld: %ld activations\n",
                        sorted_experts[i].first, sorted_experts[i].second);
             }
         }

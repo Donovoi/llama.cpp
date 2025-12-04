@@ -40,7 +40,7 @@ Given machines with varying VRAM:
 - server1: 24GB VRAM (largest share)
 - server2: 12GB VRAM
 - server3: 8GB VRAM
-- server4: 8GB VRAM  
+- server4: 8GB VRAM
 - server5: 6GB VRAM
 
 ```bash
@@ -124,10 +124,10 @@ rather than row-based splitting. This keeps complete experts together on each en
 ```cpp
 // Get expert range for a device
 std::pair<int, int> rpc_split_get_expert_range(
-    int device_id, int n_devices, int n_expert, 
+    int device_id, int n_devices, int n_expert,
     const std::vector<size_t>& vram);
 
-// Get which device owns a specific expert  
+// Get which device owns a specific expert
 int rpc_split_get_expert_endpoint(
     int expert_id, int n_devices, int n_expert,
     const std::vector<size_t>& vram);
