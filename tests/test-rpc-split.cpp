@@ -512,6 +512,90 @@ bool test_expert_vs_row_split_difference() {
     TEST_PASS();
 }
 
+// Test 16: Simulate expert tensor allocation size calculation
+bool test_expert_tensor_allocation_sizes() {
+    printf("Testing expert tensor allocation sizes... ");
+    
+    // Simulate Mixtral: 8 experts, embd=4096, ff=14336
+    const int64_t n_expert = 8;
+    const int64_t n_embd = 4096;
+    const int64_t n_ff = 14336;
+    const int n_devices = 2;
+    float tensor_split[] = {0.5f, 0.5f};
+    
+    // Expert-based split: each device gets complete experts
+    int64_t expert_low_0, expert_high_0, expert_low_1, expert_high_1;
+    get_expert_split(&expert_low_0, &expert_high_0, n_expert, tensor_split, n_devices, 0);
+    get_expert_split(&expert_low_1, &expert_high_1, n_expert, tensor_split, n_devices, 1);
+    
+    // Each device should get 4 experts
+    TEST_ASSERT(expert_high_0 - expert_low_0 == 4);
+    TEST_ASSERT(expert_high_1 - expert_low_1 == 4);
+    
+    // Calculate size per device (f32 weights for simplicity)
+    size_t bytes_per_expert = n_embd * n_ff * sizeof(float);
+    size_t size_dev_0 = (expert_high_0 - expert_low_0) * bytes_per_expert;
+    size_t size_dev_1 = (expert_high_1 - expert_low_1) * bytes_per_expert;
+    
+    // Total should equal full tensor size
+    size_t total = size_dev_0 + size_dev_1;
+    size_t expected = n_expert * bytes_per_expert;
+    TEST_ASSERT(total == expected);
+    
+    // Verify we get ~117MB per expert (4096 * 14336 * 4 bytes)
+    TEST_ASSERT(bytes_per_expert > 200 * 1024 * 1024);  // > 200MB
+    TEST_ASSERT(bytes_per_expert < 250 * 1024 * 1024);  // < 250MB
+    
+    TEST_PASS();
+}
+
+// Test 17: Expert data distribution pattern
+bool test_expert_data_distribution_pattern() {
+    printf("Testing expert data distribution pattern... ");
+    
+    // Create mock tensor data: 4 experts, each with 2x3 matrix
+    const int64_t n_expert = 4;
+    const int64_t ne0 = 2;  // embd
+    const int64_t ne1 = 3;  // ff
+    const int n_devices = 2;
+    float tensor_split[] = {0.5f, 0.5f};
+    
+    // Full tensor data: [ne0, ne1, n_expert] = [2, 3, 4]
+    // Stored in row-major order: expert 0 data, expert 1 data, ...
+    std::vector<float> full_data(ne0 * ne1 * n_expert);
+    for (int e = 0; e < n_expert; e++) {
+        for (int j = 0; j < ne1; j++) {
+            for (int i = 0; i < ne0; i++) {
+                // Value encodes expert and position
+                full_data[e * ne0 * ne1 + j * ne0 + i] = e * 100.0f + j * 10.0f + i;
+            }
+        }
+    }
+    
+    // Expert-based split
+    int64_t expert_low, expert_high;
+    get_expert_split(&expert_low, &expert_high, n_expert, tensor_split, n_devices, 0);
+    
+    // Device 0 gets experts 0-1
+    TEST_ASSERT(expert_low == 0);
+    TEST_ASSERT(expert_high == 2);
+    
+    // Extract device 0's portion
+    size_t expert_size = ne0 * ne1;
+    size_t dev0_offset = expert_low * expert_size;
+    size_t dev0_size = (expert_high - expert_low) * expert_size;
+    
+    std::vector<float> dev0_data(dev0_size);
+    memcpy(dev0_data.data(), &full_data[dev0_offset], dev0_size * sizeof(float));
+    
+    // Verify device 0 has complete experts 0 and 1
+    TEST_ASSERT(dev0_data[0] == 0.0f);      // Expert 0, row 0, col 0
+    TEST_ASSERT(dev0_data[5] == 21.0f);     // Expert 0, row 2, col 1 = 0*100 + 2*10 + 1
+    TEST_ASSERT(dev0_data[6] == 100.0f);    // Expert 1, row 0, col 0 = 1*100 + 0
+    
+    TEST_PASS();
+}
+
 int main(int argc, char ** argv) {
     (void)argc;
     (void)argv;
@@ -545,6 +629,8 @@ int main(int argc, char ** argv) {
     RUN_TEST(test_expert_owner_lookup);
     RUN_TEST(test_expert_tensor_detection);
     RUN_TEST(test_expert_vs_row_split_difference);
+    RUN_TEST(test_expert_tensor_allocation_sizes);
+    RUN_TEST(test_expert_data_distribution_pattern);
     
     printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
     
