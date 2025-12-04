@@ -107,7 +107,63 @@ bool ggml_backend_buft_is_rpc_split(ggml_backend_buffer_type_t buft);
 
 ## Future Work
 
-- [ ] Implement distributed MUL_MAT_ID to avoid gathering expert data
-- [ ] Add expert-based (rather than row-based) splitting
+- [x] Implement distributed MUL_MAT_ID to avoid gathering expert data
+- [x] Add expert-based (rather than row-based) splitting for MoE tensors
+- [x] Add profiling and monitoring for distributed inference
 - [ ] Support dynamic load balancing based on actual VRAM usage
-- [ ] Add profiling and monitoring for distributed inference
+- [ ] Implement runtime expert migration based on activation patterns
+- [ ] Add support for expert replication (hot experts on multiple endpoints)
+
+## Implementation Status (Completed)
+
+### Expert-Based Splitting (ggml-rpc-split.inc)
+
+The split buffer now supports true expert-based splitting on dimension 2 (`n_expert`)
+rather than row-based splitting. This keeps complete experts together on each endpoint:
+
+```cpp
+// Get expert range for a device
+std::pair<int, int> rpc_split_get_expert_range(
+    int device_id, int n_devices, int n_expert, 
+    const std::vector<size_t>& vram);
+
+// Get which device owns a specific expert  
+int rpc_split_get_expert_endpoint(
+    int expert_id, int n_devices, int n_expert,
+    const std::vector<size_t>& vram);
+```
+
+### Distributed MUL_MAT_ID (ggml-rpc.cpp)
+
+A new RPC command `RPC_CMD_MUL_MAT_ID_PARTIAL` enables executing partial MUL_MAT_ID
+operations on each endpoint for only the experts they own:
+
+1. Client queries which experts are on which endpoints
+2. Client fans out partial MUL_MAT_ID requests in parallel
+3. Each endpoint computes only tokens routed to its experts
+4. Client accumulates partial results into final output
+
+### Profiling Infrastructure (ggml-rpc-split.inc)
+
+Runtime profiling tracks:
+- Per-endpoint compute time (min/max/avg)
+- Load balance factor across endpoints
+- Expert activation frequency
+
+```cpp
+// Enable/disable profiling
+void rpc_split_profile_enable();
+void rpc_split_profile_disable();
+
+// Get profiling statistics
+rpc_split_profile_stats rpc_split_profile_get();
+```
+
+## Tests
+
+The test suite (`tests/test-rpc-split.cpp`) includes 24 tests covering:
+- Row-based splitting (original functionality)
+- Expert-based splitting (dimension 2)
+- Distributed MUL_MAT_ID routing and accumulation
+- Profiling infrastructure
+- Integration scenarios with small MoE models
