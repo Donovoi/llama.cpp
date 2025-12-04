@@ -361,6 +361,157 @@ bool test_mul_mat_id_routing() {
     TEST_PASS();
 }
 
+// ============================================================================
+// Expert-based splitting tests (dim 2 splitting, not row-based)
+// ============================================================================
+
+// Helper: Calculate expert range for a device (split on dimension 2)
+// This differs from row split - it keeps complete experts together
+static void get_expert_split(int64_t * expert_low, int64_t * expert_high,
+                             int64_t n_expert, const float * tensor_split,
+                             int n_devices, int device_id) {
+    float sum = 0.0f;
+    for (int i = 0; i < n_devices; i++) {
+        sum += tensor_split[i];
+    }
+    if (sum == 0.0f) sum = (float)n_devices;
+    
+    float cumulative = 0.0f;
+    for (int i = 0; i < device_id; i++) {
+        cumulative += tensor_split[i] / sum;
+    }
+    
+    *expert_low = (int64_t)(n_expert * cumulative);
+    
+    if (device_id == n_devices - 1) {
+        *expert_high = n_expert;
+    } else {
+        cumulative += tensor_split[device_id] / sum;
+        *expert_high = (int64_t)(n_expert * cumulative);
+    }
+    
+    // Ensure each device gets at least 1 expert if possible
+    if (*expert_high == *expert_low && device_id < n_devices - 1 && *expert_low < n_expert) {
+        *expert_high = *expert_low + 1;
+    }
+}
+
+// Helper: Get device that owns a specific expert
+static int get_expert_owner(int64_t expert_id, int64_t n_expert,
+                            const float * tensor_split, int n_devices) {
+    for (int dev = 0; dev < n_devices; dev++) {
+        int64_t low, high;
+        get_expert_split(&low, &high, n_expert, tensor_split, n_devices, dev);
+        if (expert_id >= low && expert_id < high) {
+            return dev;
+        }
+    }
+    return n_devices - 1;  // Fallback to last device
+}
+
+// Helper: Detect expert tensor by name
+static bool is_expert_tensor_name(const char * name) {
+    return (strstr(name, "ffn_gate_exps") != nullptr ||
+            strstr(name, "ffn_up_exps") != nullptr ||
+            strstr(name, "ffn_down_exps") != nullptr);
+}
+
+// Test 11: Expert range with equal split
+bool test_expert_equal_split() {
+    printf("Testing expert range with equal split... ");
+    
+    float tensor_split[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    
+    for (int i = 0; i < 4; i++) {
+        int64_t low, high;
+        get_expert_split(&low, &high, 8, tensor_split, 4, i);
+        TEST_ASSERT(high - low == 2);
+        TEST_ASSERT(low == i * 2);
+    }
+    
+    TEST_PASS();
+}
+
+// Test 12: Expert range with unequal VRAM (realistic cluster scenario)
+bool test_expert_unequal_vram_split() {
+    printf("Testing expert split with unequal VRAM... ");
+    
+    // Simulate: 24GB, 12GB, 8GB, 8GB, 6GB = 58GB total
+    float tensor_split[] = {24.0f, 12.0f, 8.0f, 8.0f, 6.0f};
+    int64_t ranges[5][2];
+    int64_t total = 0;
+    
+    for (int i = 0; i < 5; i++) {
+        get_expert_split(&ranges[i][0], &ranges[i][1], 384, tensor_split, 5, i);
+        total += ranges[i][1] - ranges[i][0];
+    }
+    
+    TEST_ASSERT(total == 384);  // All experts covered
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT(ranges[i][1] == ranges[i+1][0]);  // No gaps
+    }
+    TEST_ASSERT(ranges[0][1] - ranges[0][0] > ranges[4][1] - ranges[4][0]);  // First has most
+    
+    TEST_PASS();
+}
+
+// Test 13: Expert ID to device mapping (reverse lookup)
+bool test_expert_owner_lookup() {
+    printf("Testing expert ID to device owner lookup... ");
+    
+    float tensor_split[] = {0.75f, 0.25f};
+    
+    // With 75/25 split of 8 experts: device 0 gets 6, device 1 gets 2
+    for (int e = 0; e < 6; e++) {
+        TEST_ASSERT(get_expert_owner(e, 8, tensor_split, 2) == 0);
+    }
+    for (int e = 6; e < 8; e++) {
+        TEST_ASSERT(get_expert_owner(e, 8, tensor_split, 2) == 1);
+    }
+    
+    TEST_PASS();
+}
+
+// Test 14: Expert tensor detection by name
+bool test_expert_tensor_detection() {
+    printf("Testing expert tensor name detection... ");
+    
+    TEST_ASSERT(is_expert_tensor_name("blk.0.ffn_gate_exps.weight"));
+    TEST_ASSERT(is_expert_tensor_name("blk.15.ffn_up_exps.weight"));
+    TEST_ASSERT(is_expert_tensor_name("blk.31.ffn_down_exps.weight"));
+    TEST_ASSERT(!is_expert_tensor_name("blk.0.attn_q.weight"));
+    TEST_ASSERT(!is_expert_tensor_name("blk.0.ffn_gate.weight"));  // Non-expert FFN
+    TEST_ASSERT(!is_expert_tensor_name("token_embd.weight"));
+    
+    TEST_PASS();
+}
+
+// Test 15: Expert-based vs row-based split comparison
+bool test_expert_vs_row_split_difference() {
+    printf("Testing expert-based vs row-based split difference... ");
+    
+    // For MoE tensors with shape [n_embd, n_ff, n_expert]:
+    // - Row-based: splits n_ff across devices (each device has partial expert)
+    // - Expert-based: splits n_expert across devices (each device has complete experts)
+    
+    const int64_t n_expert = 8;
+    const int n_devices = 2;
+    float tensor_split[] = {0.5f, 0.5f};
+    
+    // Expert-based split
+    int64_t expert_low, expert_high;
+    get_expert_split(&expert_low, &expert_high, n_expert, tensor_split, n_devices, 0);
+    
+    // Device 0 should get experts 0-3 (complete experts)
+    TEST_ASSERT(expert_low == 0);
+    TEST_ASSERT(expert_high == 4);
+    
+    // This is different from row-based which would split each expert's n_ff rows
+    // Each device has COMPLETE experts, not partial experts
+    
+    TEST_PASS();
+}
+
 int main(int argc, char ** argv) {
     (void)argc;
     (void)argv;
@@ -375,6 +526,7 @@ int main(int argc, char ** argv) {
         if (test()) passed++; \
     } while(0)
     
+    // Row-based splitting tests
     RUN_TEST(test_row_split_calculation);
     RUN_TEST(test_unequal_split);
     RUN_TEST(test_row_rounding);
@@ -385,6 +537,14 @@ int main(int argc, char ** argv) {
     RUN_TEST(test_kimi_k2_expert_split);
     RUN_TEST(test_expert_id_mapping);
     RUN_TEST(test_mul_mat_id_routing);
+    
+    // Expert-based splitting tests (dim 2 splitting)
+    printf("\n--- Expert-Based Splitting Tests ---\n\n");
+    RUN_TEST(test_expert_equal_split);
+    RUN_TEST(test_expert_unequal_vram_split);
+    RUN_TEST(test_expert_owner_lookup);
+    RUN_TEST(test_expert_tensor_detection);
+    RUN_TEST(test_expert_vs_row_split_difference);
     
     printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
     

@@ -412,3 +412,73 @@ ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(
     GGML_LOG_INFO("RPC split buffer type created: %s\n", buft_name.c_str());
     return buft;
 }
+
+// ============================================================================
+// Expert-based splitting (for MoE expert tensors)
+// ============================================================================
+
+// Calculate expert split for a given endpoint (splits on dim 2 = n_expert)
+// This keeps complete experts together on each endpoint
+static void rpc_split_get_expert_range(int64_t * expert_low, int64_t * expert_high,
+                                       int64_t n_expert, const float * tensor_split,
+                                       int n_endpoints, int endpoint_id) {
+    // Calculate cumulative split proportions (same logic as row split)
+    float sum = 0.0f;
+    for (int i = 0; i < n_endpoints; i++) {
+        sum += tensor_split[i];
+    }
+    if (sum == 0.0f) {
+        sum = (float)n_endpoints;
+    }
+    
+    float cumulative = 0.0f;
+    for (int i = 0; i < endpoint_id; i++) {
+        cumulative += tensor_split[i] / sum;
+    }
+    
+    *expert_low = (int64_t)(n_expert * cumulative);
+    
+    if (endpoint_id == n_endpoints - 1) {
+        *expert_high = n_expert;
+    } else {
+        cumulative += tensor_split[endpoint_id] / sum;
+        *expert_high = (int64_t)(n_expert * cumulative);
+    }
+    
+    // Ensure at least one expert per endpoint if possible
+    if (*expert_high == *expert_low && endpoint_id < n_endpoints - 1 && *expert_low < n_expert) {
+        *expert_high = *expert_low + 1;
+    }
+}
+
+// Get the endpoint that owns a specific expert ID
+static int rpc_split_get_expert_endpoint(int64_t expert_id, int64_t n_expert, 
+                                         const float * tensor_split, int n_endpoints) {
+    for (int i = 0; i < n_endpoints; i++) {
+        int64_t expert_low, expert_high;
+        rpc_split_get_expert_range(&expert_low, &expert_high, n_expert, tensor_split, n_endpoints, i);
+        if (expert_id >= expert_low && expert_id < expert_high) {
+            return i;
+        }
+    }
+    return n_endpoints - 1;  // Fallback to last endpoint
+}
+
+// Check if tensor is a 3D MoE expert tensor (shape: [embd, ff, n_expert])
+static bool rpc_split_is_expert_tensor(const ggml_tensor * tensor) {
+    // Expert tensors have 3 dimensions with ne[2] > 1 (multiple experts)
+    // and names matching ffn_*_exps pattern
+    if (tensor->n_dims < 3 || tensor->ne[2] <= 1) {
+        return false;
+    }
+    
+    // Check name pattern: blk.N.ffn_*_exps
+    const char * name = tensor->name;
+    if (name == nullptr) {
+        return false;
+    }
+    
+    return (strstr(name, "ffn_gate_exps") != nullptr ||
+            strstr(name, "ffn_up_exps") != nullptr ||
+            strstr(name, "ffn_down_exps") != nullptr);
+}
