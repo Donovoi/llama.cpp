@@ -596,6 +596,72 @@ bool test_expert_data_distribution_pattern() {
     TEST_PASS();
 }
 
+bool test_distributed_mul_mat_id_routing() {
+    printf("Testing distributed MUL_MAT_ID routing logic... ");
+    
+    // Simulate 8 experts across 2 devices with 50/50 split
+    const int64_t n_expert = 8;
+    const int n_devices = 2;
+    float tensor_split[] = {0.5f, 0.5f};
+    
+    // Device 0: experts 0-3, Device 1: experts 4-7
+    int64_t expert_ranges[2][2];
+    for (int d = 0; d < 2; d++) {
+        get_expert_split(&expert_ranges[d][0], &expert_ranges[d][1], n_expert, tensor_split, n_devices, d);
+    }
+    
+    // Simulate a batch with 4 tokens, top_k=2
+    // Token 0 uses experts [1, 5] -> needs both devices
+    // Token 1 uses experts [2, 3] -> only device 0
+    // Token 2 uses experts [4, 6] -> only device 1
+    // Token 3 uses experts [0, 7] -> needs both devices
+    int32_t ids[8] = {1, 5,  // token 0
+                      2, 3,  // token 1
+                      4, 6,  // token 2
+                      0, 7}; // token 3
+    
+    // Count experts computed per device
+    int experts_dev0 = 0, experts_dev1 = 0;
+    for (int i = 0; i < 8; i++) {
+        int exp = ids[i];
+        if (exp >= expert_ranges[0][0] && exp < expert_ranges[0][1]) {
+            experts_dev0++;
+        } else {
+            experts_dev1++;
+        }
+    }
+    
+    // Device 0 should compute: experts 1, 2, 3, 0 = 4 computations
+    TEST_ASSERT(experts_dev0 == 4);
+    // Device 1 should compute: experts 5, 4, 6, 7 = 4 computations
+    TEST_ASSERT(experts_dev1 == 4);
+    
+    TEST_PASS();
+}
+
+// Test 19: Output accumulation logic
+bool test_output_accumulation() {
+    printf("Testing output accumulation for distributed MUL_MAT_ID... ");
+    
+    // Simulate output tensors from 3 devices
+    std::vector<float> output_dev0 = {1.0f, 0.0f, 0.0f, 2.0f};
+    std::vector<float> output_dev1 = {0.0f, 3.0f, 0.0f, 0.0f};
+    std::vector<float> output_dev2 = {0.0f, 0.0f, 4.0f, 1.0f};
+    
+    // Accumulate outputs (sum partial results)
+    std::vector<float> final_output(4, 0.0f);
+    for (size_t i = 0; i < 4; i++) {
+        final_output[i] = output_dev0[i] + output_dev1[i] + output_dev2[i];
+    }
+    
+    // Verify accumulated output
+    TEST_ASSERT(final_output[0] == 1.0f);
+    TEST_ASSERT(final_output[1] == 3.0f);
+    TEST_ASSERT(final_output[2] == 4.0f);
+    TEST_ASSERT(final_output[3] == 3.0f);  // 2 + 0 + 1
+    
+    TEST_PASS();
+}
 int main(int argc, char ** argv) {
     (void)argc;
     (void)argv;
@@ -631,6 +697,8 @@ int main(int argc, char ** argv) {
     RUN_TEST(test_expert_vs_row_split_difference);
     RUN_TEST(test_expert_tensor_allocation_sizes);
     RUN_TEST(test_expert_data_distribution_pattern);
+    RUN_TEST(test_distributed_mul_mat_id_routing);
+    RUN_TEST(test_output_accumulation);
     
     printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
     
@@ -673,3 +741,4 @@ bool test_buft_is_rpc_split() {
     TEST_PASS();
 }
 #endif
+

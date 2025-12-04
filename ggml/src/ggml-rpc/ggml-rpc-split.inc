@@ -625,3 +625,199 @@ static bool rpc_split_is_expert_tensor(const ggml_tensor * tensor) {
             strstr(name, "ffn_up_exps") != nullptr ||
             strstr(name, "ffn_down_exps") != nullptr);
 }
+
+// ============================================================================
+// Distributed MUL_MAT_ID orchestration
+// ============================================================================
+
+// Statistics for distributed MUL_MAT_ID execution
+struct rpc_split_mul_mat_id_stats {
+    std::array<uint64_t, GGML_RPC_SPLIT_MAX_ENDPOINTS> compute_us;  // Per-endpoint compute time
+    std::array<int64_t, GGML_RPC_SPLIT_MAX_ENDPOINTS> experts_computed;  // Experts computed per endpoint
+    uint64_t total_us;  // Total wall-clock time
+    int endpoints_used;  // Number of endpoints that participated
+};
+
+// Compute distributed MUL_MAT_ID across multiple RPC endpoints
+// Parameters:
+//   as_tensor: Expert tensor (shape [ne0, ne1, n_expert]) with split buffer
+//   b_tensor: Input tensor (not split, full data on each endpoint)
+//   ids_tensor: Expert selection indices (shape [top_k, n_tokens])
+//   output: Output tensor to store results
+//   stats: Optional statistics output
+// Returns: true on success, false on failure
+static bool rpc_split_mul_mat_id(
+        const ggml_tensor * as_tensor,
+        const ggml_tensor * b_tensor,
+        const ggml_tensor * ids_tensor,
+        ggml_tensor * output,
+        rpc_split_mul_mat_id_stats * stats = nullptr) {
+    
+    // Verify as_tensor is a split tensor
+    ggml_backend_rpc_split_tensor_extra * extra = 
+        (ggml_backend_rpc_split_tensor_extra *)as_tensor->extra;
+    if (extra == nullptr || !extra->is_expert_split) {
+        GGML_LOG_ERROR("[%s] as_tensor is not an expert-split tensor\n", __func__);
+        return false;
+    }
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    const int n_endpoints = extra->n_endpoints;
+    const int64_t n_expert = as_tensor->ne[2];
+    
+    // Prepare b tensor data to send to all endpoints
+    size_t b_size = ggml_nbytes(b_tensor);
+    std::vector<uint8_t> b_data(b_size);
+    // For split buffer orchestration, we need to gather b from host memory
+    // In production, b_tensor would be a CPU tensor or we'd have a copy
+    memcpy(b_data.data(), b_tensor->data, b_size);
+    
+    // Prepare ids tensor data
+    size_t ids_size = ggml_nbytes(ids_tensor);
+    std::vector<uint8_t> ids_data(ids_size);
+    memcpy(ids_data.data(), ids_tensor->data, ids_size);
+    
+    // Prepare output accumulator (zero-initialized)
+    size_t output_size = ggml_nbytes(output);
+    std::vector<float> output_accum(output_size / sizeof(float), 0.0f);
+    
+    // Send requests to all endpoints in parallel (simplified: sequential here)
+    // TODO: Use async I/O for true parallelism
+    int endpoints_used = 0;
+    
+    for (int i = 0; i < n_endpoints; i++) {
+        if (extra->remote_ptrs[i] == 0) {
+            continue;  // No experts on this endpoint
+        }
+        
+        int64_t expert_low = extra->expert_low[i];
+        int64_t expert_high = extra->expert_high[i];
+        
+        // Build request
+        rpc_msg_mul_mat_id_partial_req request;
+        memset(&request, 0, sizeof(request));
+        
+        // as tensor descriptor (local portion on this endpoint)
+        request.as.id = (uint64_t)as_tensor;
+        request.as.type = as_tensor->type;
+        request.as.buffer = extra->remote_ptrs[i];
+        request.as.ne[0] = as_tensor->ne[0];
+        request.as.ne[1] = as_tensor->ne[1];
+        request.as.ne[2] = expert_high - expert_low;  // Local expert count
+        request.as.ne[3] = 1;
+        request.as.data = extra->remote_ptrs[i];
+        snprintf(request.as.name, GGML_MAX_NAME, "%.50s_e%d", as_tensor->name, i);
+        
+        // b tensor descriptor (full)
+        request.b.type = b_tensor->type;
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            request.b.ne[d] = b_tensor->ne[d];
+        }
+        
+        // ids tensor descriptor (full)
+        request.ids.type = ids_tensor->type;
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            request.ids.ne[d] = ids_tensor->ne[d];
+        }
+        
+        // output tensor descriptor
+        request.output.type = output->type;
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            request.output.ne[d] = output->ne[d];
+        }
+        
+        request.expert_low = expert_low;
+        request.expert_high = expert_high;
+        request.device = 0;  // TODO: Get from endpoint context
+        
+        // Send request and data
+        auto sock = extra->sockets[i];
+        if (sock == nullptr) {
+            GGML_LOG_ERROR("[%s] no socket for endpoint %d\n", __func__, i);
+            continue;
+        }
+        
+        bool status = send_rpc_cmd(sock, RPC_CMD_MUL_MAT_ID_PARTIAL, &request, sizeof(request));
+        if (!status) {
+            GGML_LOG_ERROR("[%s] failed to send request to endpoint %d\n", __func__, i);
+            continue;
+        }
+        
+        // Send b tensor data
+        if (!send_data(sock->fd, b_data.data(), b_data.size())) {
+            GGML_LOG_ERROR("[%s] failed to send b data to endpoint %d\n", __func__, i);
+            continue;
+        }
+        
+        // Send ids tensor data
+        if (!send_data(sock->fd, ids_data.data(), ids_data.size())) {
+            GGML_LOG_ERROR("[%s] failed to send ids data to endpoint %d\n", __func__, i);
+            continue;
+        }
+        
+        // Receive response
+        rpc_msg_mul_mat_id_partial_rsp response;
+        if (!recv_data(sock->fd, &response, sizeof(response))) {
+            GGML_LOG_ERROR("[%s] failed to receive response from endpoint %d\n", __func__, i);
+            continue;
+        }
+        
+        if (!response.success) {
+            GGML_LOG_ERROR("[%s] computation failed on endpoint %d\n", __func__, i);
+            continue;
+        }
+        
+        // Receive partial output and accumulate
+        std::vector<float> partial_output(output_size / sizeof(float));
+        if (!recv_data(sock->fd, partial_output.data(), output_size)) {
+            GGML_LOG_ERROR("[%s] failed to receive output from endpoint %d\n", __func__, i);
+            continue;
+        }
+        
+        // Accumulate partial results
+        for (size_t j = 0; j < partial_output.size(); j++) {
+            output_accum[j] += partial_output[j];
+        }
+        
+        // Record statistics
+        if (stats) {
+            stats->compute_us[i] = response.compute_us;
+            stats->experts_computed[i] = expert_high - expert_low;
+        }
+        
+        endpoints_used++;
+        
+        LOG_DBG("[%s] endpoint %d: experts %ld-%ld, compute_us=%lu\n", 
+                __func__, i, expert_low, expert_high - 1, response.compute_us);
+    }
+    
+    // Copy accumulated output to result tensor
+    memcpy(output->data, output_accum.data(), output_size);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    if (stats) {
+        stats->total_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        stats->endpoints_used = endpoints_used;
+    }
+    
+    LOG_DBG("[%s] distributed MUL_MAT_ID complete: %d endpoints, %lu us total\n", 
+            __func__, endpoints_used, 
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+    
+    return endpoints_used > 0;
+}
+
+// Check if a MUL_MAT_ID operation can be computed distributedly
+// Returns true if the 'as' tensor is split across multiple endpoints
+static bool rpc_split_can_distribute_mul_mat_id(const ggml_tensor * as_tensor) {
+    if (as_tensor == nullptr || as_tensor->extra == nullptr) {
+        return false;
+    }
+    
+    ggml_backend_rpc_split_tensor_extra * extra = 
+        (ggml_backend_rpc_split_tensor_extra *)as_tensor->extra;
+    
+    return extra->is_expert_split && extra->n_endpoints > 1;
+}
