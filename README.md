@@ -1,3 +1,57 @@
+# llama.cpp (Fork with RPC Expert Split for Distributed MoE)
+
+> **🔀 This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) with experimental support for distributed Mixture-of-Experts (MoE) inference across multiple GPUs via RPC.**
+
+---
+
+## 🚀 Fork Features: RPC Expert Split
+
+This fork adds **distributed expert routing** for MoE models (like Mixtral, gpt-oss, DeepSeek) across multiple machines using llama.cpp's RPC backend. Instead of replicating the entire model on each GPU, experts are **distributed** across RPC workers, enabling:
+
+- **Run larger MoE models** than any single machine's VRAM allows
+- **Efficient expert distribution** - each GPU handles a subset of experts
+- **Automatic load balancing** based on expert activation patterns
+- **Minimal network overhead** - only activated experts communicate
+
+### Why This Fork?
+
+Standard llama.cpp RPC replicates the full model on each worker. For a 120B parameter MoE model with 128 experts, this means each GPU needs the full model in memory. With expert split:
+
+| Approach | 4 GPUs (8GB each) | Can Run |
+|----------|-------------------|---------|
+| Standard RPC | 32GB total (replicated) | ~30B models |
+| **Expert Split** | 32GB total (distributed) | **120B+ MoE models** |
+
+### Branch: `feat/rpc-expert-split`
+
+**Key Changes:**
+- `ggml/src/ggml-rpc/ggml-rpc.cpp` - Distributed `MUL_MAT_ID` operation for expert routing
+- `ggml/src/ggml-rpc/ggml-rpc-split.inc` - Expert split buffer management and allocation
+- Support for profiling expert activation patterns
+- Integration tests for distributed MoE scenarios
+
+### Usage
+
+```bash
+# Start RPC workers on each machine (each gets subset of experts)
+rpc-server -H 0.0.0.0 -p 50052
+
+# Run with distributed experts
+llama-cli -m mixtral-8x22b.gguf \
+  --rpc gpu1:50052,gpu2:50052,gpu3:50052,gpu4:50052 \
+  -ngl 999 -p "Hello"
+```
+
+### Documentation
+
+See [docs/rpc-expert-split.md](docs/rpc-expert-split.md) for detailed architecture and implementation notes.
+
+---
+
+*Below is the original llama.cpp README:*
+
+---
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
