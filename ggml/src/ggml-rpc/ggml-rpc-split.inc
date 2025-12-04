@@ -377,14 +377,8 @@ ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(
         return it->second;
     }
     
-    // Verify all endpoints are reachable
-    for (int i = 0; i < n_endpoints; i++) {
-        auto sock = get_socket(endpoints[i]);
-        if (sock == nullptr) {
-            GGML_LOG_ERROR("RPC split buffer: cannot connect to endpoint %s\n", endpoints[i]);
-            return nullptr;
-        }
-    }
+    // Note: We don't verify endpoint connectivity here since it can abort on failure.
+    // Connectivity will be verified when the buffer is actually allocated.
     
     // Create the context
     ggml_backend_rpc_split_buffer_type_context * ctx = new ggml_backend_rpc_split_buffer_type_context{};
