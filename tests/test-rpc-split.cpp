@@ -390,3 +390,40 @@ int main(int argc, char ** argv) {
     
     return (passed == total) ? 0 : 1;
 }
+
+// Additional tests that can be run with the compiled library
+// These test the actual RPC split buffer API
+
+#ifdef TEST_WITH_LIBRARY
+#include "ggml-rpc.h"
+
+// Test 11: Split buffer type creation (requires no active servers, just API test)
+bool test_split_buffer_type_api() {
+    printf("Testing split buffer type API... ");
+    
+    // These endpoints don't need to be valid for API testing
+    const char * endpoints[] = {"127.0.0.1:50052", "127.0.0.1:50053", nullptr};
+    uint32_t devices[] = {0, 0};
+    float tensor_split[] = {0.6f, 0.4f};
+    
+    // This will fail to connect but should not crash
+    // Just verify the API exists and is callable
+    auto buft = ggml_backend_rpc_split_buffer_type(endpoints, devices, tensor_split, 2);
+    
+    // We expect nullptr since endpoints aren't available
+    // But if servers were running, this should succeed
+    printf("(returned %s) ", buft ? "buft" : "nullptr");
+    
+    TEST_PASS();
+}
+
+// Test 12: Check if buffer type is RPC split
+bool test_buft_is_rpc_split() {
+    printf("Testing ggml_backend_buft_is_rpc_split... ");
+    
+    // nullptr should return false
+    TEST_ASSERT(!ggml_backend_buft_is_rpc_split(nullptr));
+    
+    TEST_PASS();
+}
+#endif
