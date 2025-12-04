@@ -107,6 +107,7 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    RPC_CMD_MUL_MAT_ID_PARTIAL,  // Compute MUL_MAT_ID for a subset of experts
     RPC_CMD_COUNT,
 };
 
@@ -217,6 +218,24 @@ struct rpc_msg_get_device_memory_rsp {
 
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
+};
+
+// MUL_MAT_ID_PARTIAL: Compute MUL_MAT_ID for a subset of experts
+// Request format: [header] [as_tensor] [b_data] [ids_data]
+// where as_tensor describes the LOCAL portion of experts on this endpoint
+struct rpc_msg_mul_mat_id_partial_req {
+    rpc_tensor as;          // Expert tensor (local portion: [ne0, ne1, n_local_experts])
+    rpc_tensor b;           // Input tensor b (full, not split)
+    rpc_tensor ids;         // Expert selection tensor (full, not split)
+    rpc_tensor output;      // Output tensor to write results
+    int64_t expert_low;     // First expert ID this endpoint owns
+    int64_t expert_high;    // One past last expert ID this endpoint owns
+    uint32_t device;        // Device to use for computation
+};
+
+struct rpc_msg_mul_mat_id_partial_rsp {
+    bool success;           // Whether computation succeeded
+    uint64_t compute_us;    // Computation time in microseconds
 };
 
 #pragma pack(pop)
@@ -981,6 +1000,10 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    bool mul_mat_id_partial(const rpc_msg_mul_mat_id_partial_req & request, 
+                            const std::vector<uint8_t> & b_data,
+                            const std::vector<uint8_t> & ids_data,
+                            rpc_msg_mul_mat_id_partial_rsp & response);
 
     struct stored_graph {
         ggml_context_ptr ctx_ptr;
@@ -1538,6 +1561,105 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+bool rpc_server::mul_mat_id_partial(const rpc_msg_mul_mat_id_partial_req & request,
+                                    const std::vector<uint8_t> & b_data,
+                                    const std::vector<uint8_t> & ids_data,
+                                    rpc_msg_mul_mat_id_partial_rsp & response) {
+    // MUL_MAT_ID_PARTIAL: Compute MUL_MAT_ID for a subset of experts
+    // This endpoint owns experts [expert_low, expert_high)
+    // We need to:
+    // 1. Filter the ids tensor to only include experts we own
+    // 2. Compute MUL_MAT_ID with our local expert tensor portion
+    // 3. Return the partial output (contributions from our experts only)
+    
+    uint32_t dev_id = request.device;
+    if (dev_id >= backends.size()) {
+        GGML_LOG_ERROR("[%s] invalid device: %u\n", __func__, dev_id);
+        response.success = false;
+        return true;
+    }
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    // Get the backend
+    ggml_backend_t backend = backends[dev_id];
+    
+    // Create a compute context
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 256 * 1024 * 1024,  // 256MB for graph
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    if (!ctx_ptr) {
+        GGML_LOG_ERROR("[%s] failed to create context\n", __func__);
+        response.success = false;
+        return true;
+    }
+    ggml_context * ctx = ctx_ptr.get();
+    
+    // Deserialize the local expert tensor (already on this device)
+    ggml_tensor * as_local = deserialize_tensor(ctx, &request.as);
+    if (!as_local) {
+        GGML_LOG_ERROR("[%s] failed to deserialize as tensor\n", __func__);
+        response.success = false;
+        return true;
+    }
+    
+    // Create b tensor from received data
+    int64_t b_ne[GGML_MAX_DIMS] = {request.b.ne[0], request.b.ne[1], request.b.ne[2], request.b.ne[3]};
+    ggml_tensor * b = ggml_new_tensor(ctx, (ggml_type)request.b.type, GGML_MAX_DIMS, b_ne);
+    
+    // Create ids tensor from received data
+    int64_t ids_ne[GGML_MAX_DIMS] = {request.ids.ne[0], request.ids.ne[1], request.ids.ne[2], request.ids.ne[3]};
+    ggml_tensor * ids = ggml_new_tensor(ctx, (ggml_type)request.ids.type, GGML_MAX_DIMS, ids_ne);
+    
+    // Allocate buffer for b and ids tensors on the backend
+    ggml_backend_buffer_t buf_compute = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf_compute) {
+        GGML_LOG_ERROR("[%s] failed to allocate compute buffer\n", __func__);
+        response.success = false;
+        return true;
+    }
+    
+    // Copy b and ids data to device
+    ggml_backend_tensor_set(b, b_data.data(), 0, b_data.size());
+    ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size());
+    
+    // Create MUL_MAT_ID operation
+    // Note: The as tensor has local expert indices [0, n_local_experts)
+    // but ids contains global expert indices [0, n_total_experts)
+    // We need to remap: global_id -> local_id = global_id - expert_low
+    ggml_tensor * result = ggml_mul_mat_id(ctx, as_local, b, ids);
+    
+    // Build compute graph
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+    
+    // Compute
+    ggml_backend_graph_compute(backend, graph);
+    
+    // Copy result to output buffer
+    ggml_tensor * output = deserialize_tensor(ctx, &request.output);
+    if (output && output->data) {
+        size_t result_size = ggml_nbytes(result);
+        ggml_backend_tensor_get(result, output->data, 0, result_size);
+    }
+    
+    // Cleanup
+    ggml_backend_buffer_free(buf_compute);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    response.compute_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    response.success = true;
+    
+    LOG_DBG("[%s] computed MUL_MAT_ID_PARTIAL for experts %ld-%ld in %lu us\n", 
+            __func__, request.expert_low, request.expert_high - 1, response.compute_us);
+    
+    return true;
+}
+
 rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
@@ -1777,6 +1899,40 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_get_device_memory_rsp response;
                 if (!server.get_device_memory(request, response)) {
+                    return;
+                }
+                if (!send_msg(sockfd, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_MUL_MAT_ID_PARTIAL: {
+                // Receive the fixed-size header
+                rpc_msg_mul_mat_id_partial_req request;
+                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                    return;
+                }
+                
+                // Calculate sizes for b and ids data
+                size_t b_size = ggml_row_size((ggml_type)request.b.type, request.b.ne[0]) * 
+                                request.b.ne[1] * request.b.ne[2] * request.b.ne[3];
+                size_t ids_size = request.ids.ne[0] * request.ids.ne[1] * 
+                                  request.ids.ne[2] * request.ids.ne[3] * sizeof(int32_t);
+                
+                // Receive b tensor data
+                std::vector<uint8_t> b_data(b_size);
+                if (!recv_msg(sockfd, b_data.data(), b_size)) {
+                    return;
+                }
+                
+                // Receive ids tensor data
+                std::vector<uint8_t> ids_data(ids_size);
+                if (!recv_msg(sockfd, ids_data.data(), ids_size)) {
+                    return;
+                }
+                
+                rpc_msg_mul_mat_id_partial_rsp response;
+                if (!server.mul_mat_id_partial(request, b_data, ids_data, response)) {
                     return;
                 }
                 if (!send_msg(sockfd, &response, sizeof(response))) {

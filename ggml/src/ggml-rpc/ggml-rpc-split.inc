@@ -608,9 +608,10 @@ static int rpc_split_get_expert_endpoint(int64_t expert_id, int64_t n_expert,
 
 // Check if tensor is a 3D MoE expert tensor (shape: [embd, ff, n_expert])
 static bool rpc_split_is_expert_tensor(const ggml_tensor * tensor) {
-    // Expert tensors have 3 dimensions with ne[2] > 1 (multiple experts)
+    // Expert tensors have 3+ dimensions with ne[2] > 1 (multiple experts)
     // and names matching ffn_*_exps pattern
-    if (tensor->n_dims < 3 || tensor->ne[2] <= 1) {
+    // Note: ggml_n_dims() returns the number of dimensions with ne[i] > 1
+    if (ggml_n_dims(tensor) < 3 || tensor->ne[2] <= 1) {
         return false;
     }
     
