@@ -18,6 +18,12 @@ GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device);
 
+// RPC split buffer type - distributes tensor rows across multiple RPC endpoints
+// Used for distributing large MoE expert tensors across multiple backends
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_split_buffer_type(
+    const char ** endpoints, const uint32_t * devices, const float * tensor_split, int n_endpoints);
+GGML_BACKEND_API bool ggml_backend_buft_is_rpc_split(ggml_backend_buffer_type_t buft);
+
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,

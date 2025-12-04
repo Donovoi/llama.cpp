@@ -2077,4 +2077,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
 }
 
 
+// Include RPC split buffer implementation for MoE expert distribution
+#include "ggml-rpc-split.inc"
+
 GGML_BACKEND_DL_IMPL(ggml_backend_rpc_reg)
