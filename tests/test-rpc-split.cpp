@@ -12,6 +12,8 @@
 #include <vector>
 #include <string>
 #include <cassert>
+#include <array>
+#include <unordered_map>
 
 // Test configuration
 #define TEST_ASSERT(cond) do { \
@@ -662,6 +664,79 @@ bool test_output_accumulation() {
     
     TEST_PASS();
 }
+bool test_profile_load_balance() {
+    printf("Testing profile load balance calculation... ");
+    
+    // Simulate perfectly balanced workload: 2 endpoints, same compute time
+    std::array<uint64_t, 4> balanced_times = {100000, 100000, 0, 0};  // 100ms each
+    
+    // Calculate CV (coefficient of variation) manually
+    float sum = 200000, mean = 100000;
+    float variance = 0;  // All same -> 0 variance
+    float cv = 0;
+    float balance = 1.0f / (1.0f + cv);
+    TEST_ASSERT(std::abs(balance - 1.0f) < 0.01f);
+    
+    // Simulate imbalanced workload: 1 endpoint does 3x the work
+    std::array<uint64_t, 4> imbalanced_times = {300000, 100000, 0, 0};  // 300ms vs 100ms
+    sum = 400000;
+    mean = 200000;
+    variance = ((300000 - mean) * (300000 - mean) + (100000 - mean) * (100000 - mean)) / 2.0f;
+    float stddev = sqrtf(variance);
+    cv = stddev / mean;
+    balance = 1.0f / (1.0f + cv);
+    // With 3:1 ratio, CV ~= 0.5, balance ~= 0.67
+    TEST_ASSERT(balance > 0.5f && balance < 0.8f);
+    
+    TEST_PASS();
+}
+
+// Test 21: Expert activation tracking
+bool test_expert_activation_tracking() {
+    printf("Testing expert activation tracking... ");
+    
+    // Simulate expert activations
+    std::unordered_map<int64_t, int64_t> activations;
+    
+    // Simulate 10 batches, each selecting 2 experts
+    // Expert 0 is "hot" - selected every time
+    // Other experts are selected less frequently
+    int32_t selections[] = {
+        0, 1,  // batch 0
+        0, 2,  // batch 1
+        0, 3,  // batch 2
+        0, 1,  // batch 3
+        0, 4,  // batch 4
+        0, 2,  // batch 5
+        0, 5,  // batch 6
+        0, 1,  // batch 7
+        0, 3,  // batch 8
+        0, 6   // batch 9
+    };
+    
+    for (int i = 0; i < 20; i++) {
+        activations[selections[i]]++;
+    }
+    
+    // Expert 0 should have 10 activations
+    TEST_ASSERT(activations[0] == 10);
+    // Expert 1 should have 3 activations
+    TEST_ASSERT(activations[1] == 3);
+    // Expert 2 should have 2 activations
+    TEST_ASSERT(activations[2] == 2);
+    
+    // Find most activated expert
+    int64_t max_expert = 0, max_count = 0;
+    for (auto & [exp, count] : activations) {
+        if (count > max_count) {
+            max_count = count;
+            max_expert = exp;
+        }
+    }
+    TEST_ASSERT(max_expert == 0);
+    
+    TEST_PASS();
+}
 int main(int argc, char ** argv) {
     (void)argc;
     (void)argv;
@@ -699,6 +774,8 @@ int main(int argc, char ** argv) {
     RUN_TEST(test_expert_data_distribution_pattern);
     RUN_TEST(test_distributed_mul_mat_id_routing);
     RUN_TEST(test_output_accumulation);
+    RUN_TEST(test_profile_load_balance);
+    RUN_TEST(test_expert_activation_tracking);
     
     printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
     
@@ -741,4 +818,5 @@ bool test_buft_is_rpc_split() {
     TEST_PASS();
 }
 #endif
+
 

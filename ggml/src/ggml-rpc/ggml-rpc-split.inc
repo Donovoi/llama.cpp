@@ -821,3 +821,171 @@ static bool rpc_split_can_distribute_mul_mat_id(const ggml_tensor * as_tensor) {
     
     return extra->is_expert_split && extra->n_endpoints > 1;
 }
+
+// ============================================================================
+// Profiling infrastructure for distributed MoE inference
+// ============================================================================
+
+// Profiling data for a single distributed computation
+struct rpc_split_profile_entry {
+    uint64_t timestamp_us;      // Wall clock timestamp when operation started
+    uint64_t total_time_us;     // Total wall clock time for operation
+    uint64_t network_send_us;   // Time spent sending data
+    uint64_t network_recv_us;   // Time spent receiving data
+    uint64_t compute_us;        // Time spent in computation (sum of endpoint times)
+    size_t bytes_sent;          // Total bytes sent to endpoints
+    size_t bytes_received;      // Total bytes received from endpoints
+    int endpoints_active;       // Number of endpoints that participated
+    int64_t experts_computed;   // Total expert computations
+};
+
+// Accumulated profiling statistics
+struct rpc_split_profile_stats {
+    // Per-endpoint statistics
+    struct endpoint_stats {
+        uint64_t total_compute_us;      // Total compute time
+        uint64_t total_network_us;      // Total network time (send + recv)
+        size_t total_bytes_sent;        // Total bytes sent
+        size_t total_bytes_received;    // Total bytes received
+        int64_t total_experts_computed; // Total expert computations
+        int64_t activation_count;       // Times this endpoint was activated
+    };
+    std::array<endpoint_stats, GGML_RPC_SPLIT_MAX_ENDPOINTS> endpoints;
+    
+    // Global statistics
+    uint64_t total_operations;          // Number of distributed operations
+    uint64_t total_time_us;             // Total time across all operations
+    uint64_t min_operation_us;          // Fastest operation
+    uint64_t max_operation_us;          // Slowest operation
+    
+    // Expert activation frequency (for load balancing analysis)
+    std::unordered_map<int64_t, int64_t> expert_activation_count;
+    
+    rpc_split_profile_stats() : total_operations(0), total_time_us(0), 
+                                 min_operation_us(UINT64_MAX), max_operation_us(0) {
+        for (auto & ep : endpoints) {
+            memset(&ep, 0, sizeof(ep));
+        }
+    }
+    
+    void record_operation(const rpc_split_profile_entry & entry, 
+                          const int32_t * ids, size_t ids_count) {
+        total_operations++;
+        total_time_us += entry.total_time_us;
+        min_operation_us = std::min(min_operation_us, entry.total_time_us);
+        max_operation_us = std::max(max_operation_us, entry.total_time_us);
+        
+        // Track expert activations
+        for (size_t i = 0; i < ids_count; i++) {
+            expert_activation_count[ids[i]]++;
+        }
+    }
+    
+    void record_endpoint(int endpoint_id, uint64_t compute_us, uint64_t network_us,
+                         size_t bytes_sent, size_t bytes_received, int64_t experts) {
+        if (endpoint_id < 0 || endpoint_id >= GGML_RPC_SPLIT_MAX_ENDPOINTS) return;
+        
+        auto & ep = endpoints[endpoint_id];
+        ep.total_compute_us += compute_us;
+        ep.total_network_us += network_us;
+        ep.total_bytes_sent += bytes_sent;
+        ep.total_bytes_received += bytes_received;
+        ep.total_experts_computed += experts;
+        ep.activation_count++;
+    }
+    
+    // Get load balance factor: 1.0 = perfectly balanced, < 1.0 = imbalanced
+    float get_load_balance(int n_endpoints) const {
+        if (n_endpoints <= 1) return 1.0f;
+        
+        // Calculate coefficient of variation of compute times
+        float sum = 0, sum_sq = 0;
+        int active = 0;
+        for (int i = 0; i < n_endpoints; i++) {
+            if (endpoints[i].activation_count > 0) {
+                float t = (float)endpoints[i].total_compute_us;
+                sum += t;
+                sum_sq += t * t;
+                active++;
+            }
+        }
+        
+        if (active <= 1) return 1.0f;
+        
+        float mean = sum / active;
+        float variance = (sum_sq / active) - (mean * mean);
+        float stddev = sqrtf(variance);
+        float cv = stddev / mean;  // Coefficient of variation
+        
+        // Convert CV to balance factor: CV=0 -> 1.0, CV=1 -> 0.5, etc.
+        return 1.0f / (1.0f + cv);
+    }
+    
+    // Print summary statistics
+    void print_summary(int n_endpoints) const {
+        printf("\n=== RPC Split Profiling Summary ===\n\n");
+        printf("Total operations: %lu\n", total_operations);
+        printf("Total time: %.2f ms\n", total_time_us / 1000.0);
+        printf("Avg time: %.2f ms\n", total_operations > 0 ? (total_time_us / total_operations) / 1000.0 : 0);
+        printf("Min/Max: %.2f / %.2f ms\n", min_operation_us / 1000.0, max_operation_us / 1000.0);
+        printf("Load balance: %.1f%%\n\n", get_load_balance(n_endpoints) * 100);
+        
+        printf("Per-endpoint statistics:\n");
+        for (int i = 0; i < n_endpoints; i++) {
+            const auto & ep = endpoints[i];
+            if (ep.activation_count == 0) continue;
+            
+            printf("  Endpoint %d:\n", i);
+            printf("    Activations: %ld\n", ep.activation_count);
+            printf("    Compute: %.2f ms (%.1f%%)\n", 
+                   ep.total_compute_us / 1000.0,
+                   total_time_us > 0 ? (ep.total_compute_us * 100.0 / total_time_us) : 0);
+            printf("    Network: %.2f ms\n", ep.total_network_us / 1000.0);
+            printf("    Data sent: %.2f MB\n", ep.total_bytes_sent / (1024.0 * 1024.0));
+            printf("    Data recv: %.2f MB\n", ep.total_bytes_received / (1024.0 * 1024.0));
+            printf("    Experts computed: %ld\n", ep.total_experts_computed);
+        }
+        
+        // Print top activated experts
+        if (!expert_activation_count.empty()) {
+            printf("\nTop 10 most activated experts:\n");
+            std::vector<std::pair<int64_t, int64_t>> sorted_experts(
+                expert_activation_count.begin(), expert_activation_count.end());
+            std::sort(sorted_experts.begin(), sorted_experts.end(),
+                     [](const auto & a, const auto & b) { return a.second > b.second; });
+            
+            for (size_t i = 0; i < std::min(sorted_experts.size(), (size_t)10); i++) {
+                printf("  Expert %ld: %ld activations\n", 
+                       sorted_experts[i].first, sorted_experts[i].second);
+            }
+        }
+        printf("\n");
+    }
+};
+
+// Global profiling instance (thread-local for safety)
+static thread_local rpc_split_profile_stats * g_rpc_split_profile = nullptr;
+
+// Enable profiling for the current thread
+static void rpc_split_profile_enable() {
+    if (g_rpc_split_profile == nullptr) {
+        g_rpc_split_profile = new rpc_split_profile_stats();
+    }
+}
+
+// Disable profiling and get final stats
+static rpc_split_profile_stats * rpc_split_profile_disable() {
+    auto * stats = g_rpc_split_profile;
+    g_rpc_split_profile = nullptr;
+    return stats;
+}
+
+// Get current profiling stats (returns nullptr if profiling not enabled)
+static rpc_split_profile_stats * rpc_split_profile_get() {
+    return g_rpc_split_profile;
+}
+
+// Check if profiling is enabled
+static bool rpc_split_profile_enabled() {
+    return g_rpc_split_profile != nullptr;
+}
