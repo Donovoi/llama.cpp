@@ -737,191 +737,6 @@ bool test_expert_activation_tracking() {
     
     TEST_PASS();
 }
-
-// =============================================================================
-// Integration Tests: Small MoE Scenarios
-// =============================================================================
-
-bool test_moe_8_experts_2_endpoints() {
-    printf("Testing full MoE workflow: 8 experts, 2 endpoints... ");
-    
-    // Simulate 2 endpoints with equal VRAM (8GB each)
-    float tensor_split[] = {8.0f, 8.0f};  // Equal VRAM
-    const int n_expert = 8;
-    const int n_devices = 2;
-    
-    // Each endpoint should get 4 experts
-    // Endpoint 0: experts 0-3
-    // Endpoint 1: experts 4-7
-    
-    // Verify expert ranges
-    for (int i = 0; i < n_devices; i++) {
-        int64_t low, high;
-        get_expert_split(&low, &high, n_expert, tensor_split, n_devices, i);
-        int expected_low = (i == 0) ? 0 : 4;
-        int expected_high = (i == 0) ? 4 : 8;
-        TEST_ASSERT(low == expected_low && high == expected_high);
-    }
-    
-    // Verify expert-to-endpoint mapping
-    for (int expert = 0; expert < n_expert; expert++) {
-        int expected_endpoint = expert < 4 ? 0 : 1;
-        int actual_endpoint = get_expert_owner(expert, n_expert, tensor_split, n_devices);
-        TEST_ASSERT(actual_endpoint == expected_endpoint);
-    }
-    
-    // Simulate token routing: 8 tokens, each routed to 2 experts (top-k=2)
-    std::vector<std::pair<int, int>> token_experts = {
-        {0, 5}, {1, 2}, {3, 7}, {4, 5}, {0, 4}, {6, 7}, {2, 3}, {1, 6},
-    };
-    
-    // Count tokens per endpoint
-    std::array<int, 2> tokens_per_endpoint = {0, 0};
-    std::array<int, 8> expert_activations = {0, 0, 0, 0, 0, 0, 0, 0};
-    
-    for (const auto& [e1, e2] : token_experts) {
-        int ep1 = get_expert_owner(e1, n_expert, tensor_split, n_devices);
-        int ep2 = get_expert_owner(e2, n_expert, tensor_split, n_devices);
-        tokens_per_endpoint[ep1]++;
-        tokens_per_endpoint[ep2]++;
-        expert_activations[e1]++;
-        expert_activations[e2]++;
-    }
-    
-    // Verify reasonable load balance (within 2x)
-    float ratio = (float)std::max(tokens_per_endpoint[0], tokens_per_endpoint[1]) /
-                  (float)std::min(tokens_per_endpoint[0], tokens_per_endpoint[1]);
-    TEST_ASSERT(ratio < 2.0f);
-    
-    // Simulate expert tensor data - smaller dimensions for testing
-    const int test_embd = 64;
-    const int test_ff = 128;
-    std::vector<float> expert_weights(test_embd * test_ff * n_expert);
-    
-    for (int e = 0; e < n_expert; e++) {
-        for (int i = 0; i < test_embd * test_ff; i++) {
-            expert_weights[e * test_embd * test_ff + i] = e * 1000.0f + i;
-        }
-    }
-    
-    // Verify data slicing for each endpoint
-    for (int ep = 0; ep < n_devices; ep++) {
-        int64_t low, high;
-        get_expert_split(&low, &high, n_expert, tensor_split, n_devices, ep);
-        int n_local = (int)(high - low);
-        size_t offset = low * test_embd * test_ff;
-        
-        for (int local_expert = 0; local_expert < n_local; local_expert++) {
-            int global_expert = (int)low + local_expert;
-            float expected = global_expert * 1000.0f;
-            float actual = expert_weights[offset + local_expert * test_embd * test_ff];
-            TEST_ASSERT(actual == expected);
-        }
-    }
-    
-    // Simulate output accumulation
-    const int n_tokens = 8;
-    std::vector<float> accumulated_output(n_tokens * test_embd, 0.0f);
-    
-    for (int ep = 0; ep < n_devices; ep++) {
-        int64_t low, high;
-        get_expert_split(&low, &high, n_expert, tensor_split, n_devices, ep);
-        std::vector<float> partial_output(n_tokens * test_embd, 0.0f);
-        
-        for (int t = 0; t < n_tokens; t++) {
-            auto [e1, e2] = token_experts[t];
-            if (e1 >= low && e1 < high) {
-                for (int i = 0; i < test_embd; i++) partial_output[t * test_embd + i] += e1 + 1;
-            }
-            if (e2 >= low && e2 < high) {
-                for (int i = 0; i < test_embd; i++) partial_output[t * test_embd + i] += e2 + 1;
-            }
-        }
-        for (size_t i = 0; i < accumulated_output.size(); i++) {
-            accumulated_output[i] += partial_output[i];
-        }
-    }
-    
-    // Verify accumulated results
-    for (int t = 0; t < n_tokens; t++) {
-        auto [e1, e2] = token_experts[t];
-        float expected = (float)((e1 + 1) + (e2 + 1));
-        TEST_ASSERT(accumulated_output[t * test_embd] == expected);
-    }
-    
-    TEST_PASS();
-}
-
-bool test_moe_unequal_vram_distribution() {
-    printf("Testing MoE with unequal VRAM (16GB vs 8GB)... ");
-    
-    float tensor_split[] = {16.0f, 8.0f};  // 2:1 VRAM ratio
-    const int n_expert = 8;
-    const int n_devices = 2;
-    
-    int64_t low0, high0, low1, high1;
-    get_expert_split(&low0, &high0, n_expert, tensor_split, n_devices, 0);
-    get_expert_split(&low1, &high1, n_expert, tensor_split, n_devices, 1);
-    
-    int experts_ep0 = (int)(high0 - low0);
-    int experts_ep1 = (int)(high1 - low1);
-    
-    // Endpoint with more VRAM should have more experts
-    TEST_ASSERT(experts_ep0 > experts_ep1);
-    TEST_ASSERT(experts_ep0 + experts_ep1 == n_expert);
-    
-    // Verify no gaps in expert assignment
-    TEST_ASSERT(high0 == low1);
-    TEST_ASSERT(low0 == 0);
-    TEST_ASSERT(high1 == n_expert);
-    
-    TEST_PASS();
-}
-
-bool test_moe_data_integrity() {
-    printf("Testing MoE data integrity (split/reconstruct)... ");
-    
-    const int n_expert = 4;
-    const int n_embd = 32;
-    const int n_ff = 64;
-    const int n_devices = 2;
-    float tensor_split[] = {1.0f, 1.0f};
-    
-    std::vector<float> original_data(n_expert * n_embd * n_ff);
-    
-    for (size_t i = 0; i < original_data.size(); i++) {
-        original_data[i] = std::sin(i * 0.01f) * 100.0f;
-    }
-    
-    std::vector<std::vector<float>> endpoint_data(n_devices);
-    
-    for (int ep = 0; ep < n_devices; ep++) {
-        int64_t low, high;
-        get_expert_split(&low, &high, n_expert, tensor_split, n_devices, ep);
-        size_t offset = low * n_embd * n_ff;
-        size_t count = (high - low) * n_embd * n_ff;
-        endpoint_data[ep].resize(count);
-        std::copy(original_data.begin() + offset, 
-                  original_data.begin() + offset + count,
-                  endpoint_data[ep].begin());
-    }
-    
-    std::vector<float> reconstructed(original_data.size());
-    for (int ep = 0; ep < n_devices; ep++) {
-        int64_t low, high;
-        get_expert_split(&low, &high, n_expert, tensor_split, n_devices, ep);
-        size_t offset = low * n_embd * n_ff;
-        std::copy(endpoint_data[ep].begin(), endpoint_data[ep].end(),
-                  reconstructed.begin() + offset);
-    }
-    
-    for (size_t i = 0; i < original_data.size(); i++) {
-        TEST_ASSERT(original_data[i] == reconstructed[i]);
-    }
-    
-    TEST_PASS();
-}
-
 int main(int argc, char ** argv) {
     (void)argc;
     (void)argv;
@@ -961,53 +776,249 @@ int main(int argc, char ** argv) {
     RUN_TEST(test_output_accumulation);
     RUN_TEST(test_profile_load_balance);
     RUN_TEST(test_expert_activation_tracking);
+
+
+
+// =============================================================================
+// Integration Test: Small MoE with 8 Experts Across 2 Endpoints
+// =============================================================================
+
+void test_moe_8_experts_2_endpoints() {
+    printf("Testing full MoE workflow: 8 experts, 2 endpoints...\n");
     
-    // Integration tests: MoE scenarios
-    printf("\n--- Integration Tests: MoE Scenarios ---\n\n");
-    RUN_TEST(test_moe_8_experts_2_endpoints);
-    RUN_TEST(test_moe_unequal_vram_distribution);
-    RUN_TEST(test_moe_data_integrity);
+    // Simulate 2 endpoints with equal VRAM (8GB each)
+    std::vector<size_t> vram = {8ULL * 1024 * 1024 * 1024, 8ULL * 1024 * 1024 * 1024};
+    const int n_expert = 8;
+    const int n_embd = 4096;
+    const int n_ff = 11008;  // Typical for 7B-class models
     
-    printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
+    // Each endpoint should get 4 experts
+    // Endpoint 0: experts 0-3
+    // Endpoint 1: experts 4-7
     
-    return (passed == total) ? 0 : 1;
+    // Verify expert ranges
+    for (size_t i = 0; i < vram.size(); i++) {
+        auto [low, high] = rpc_split_get_expert_range(i, vram.size(), n_expert, vram);
+        int expected_low = (i == 0) ? 0 : 4;
+        int expected_high = (i == 0) ? 4 : 8;
+        assert(low == expected_low && high == expected_high);
+    }
+    
+    // Verify expert-to-endpoint mapping
+    for (int expert = 0; expert < n_expert; expert++) {
+        int expected_endpoint = expert < 4 ? 0 : 1;
+        int actual_endpoint = rpc_split_get_expert_endpoint(expert, vram.size(), n_expert, vram);
+        assert(actual_endpoint == expected_endpoint);
+    }
+    
+    // Simulate token routing: 16 tokens, each routed to 2 experts (top-k=2)
+    // Token routing pattern (simulating typical MoE routing):
+    std::vector<std::pair<int, int>> token_experts = {
+        {0, 5},  // Token 0 -> experts 0, 5 (split across endpoints)
+        {1, 2},  // Token 1 -> experts 1, 2 (both on endpoint 0)
+        {3, 7},  // Token 2 -> experts 3, 7 (split across endpoints)
+        {4, 5},  // Token 3 -> experts 4, 5 (both on endpoint 1)
+        {0, 4},  // Token 4 -> experts 0, 4 (split)
+        {6, 7},  // Token 5 -> experts 6, 7 (both on endpoint 1)
+        {2, 3},  // Token 6 -> experts 2, 3 (both on endpoint 0)
+        {1, 6},  // Token 7 -> experts 1, 6 (split)
+    };
+    
+    // Count tokens per endpoint
+    std::array<int, 2> tokens_per_endpoint = {0, 0};
+    std::array<int, 8> expert_activations = {0, 0, 0, 0, 0, 0, 0, 0};
+    
+    for (const auto& [e1, e2] : token_experts) {
+        int ep1 = rpc_split_get_expert_endpoint(e1, vram.size(), n_expert, vram);
+        int ep2 = rpc_split_get_expert_endpoint(e2, vram.size(), n_expert, vram);
+        tokens_per_endpoint[ep1]++;
+        tokens_per_endpoint[ep2]++;
+        expert_activations[e1]++;
+        expert_activations[e2]++;
+    }
+    
+    printf("  Token distribution: Endpoint 0=%d, Endpoint 1=%d\n", 
+           tokens_per_endpoint[0], tokens_per_endpoint[1]);
+    
+    // Verify reasonable load balance (within 2x)
+    float ratio = (float)std::max(tokens_per_endpoint[0], tokens_per_endpoint[1]) /
+                  (float)std::min(tokens_per_endpoint[0], tokens_per_endpoint[1]);
+    assert(ratio < 2.0f);
+    
+    // Simulate expert tensor data
+    // Expert weight tensor shape: [n_embd, n_ff, n_expert] = [4096, 11008, 8]
+    // For testing, use smaller dimensions
+    const int test_embd = 64;
+    const int test_ff = 128;
+    std::vector<float> expert_weights(test_embd * test_ff * n_expert);
+    
+    // Initialize with pattern: weight[i] = expert_id * 1000 + position
+    for (int e = 0; e < n_expert; e++) {
+        for (int i = 0; i < test_embd * test_ff; i++) {
+            expert_weights[e * test_embd * test_ff + i] = e * 1000.0f + i;
+        }
+    }
+    
+    // Verify data slicing for each endpoint
+    for (size_t ep = 0; ep < vram.size(); ep++) {
+        auto [low, high] = rpc_split_get_expert_range(ep, vram.size(), n_expert, vram);
+        int n_local = high - low;
+        
+        // Calculate expected data offset and size
+        size_t offset = low * test_embd * test_ff;
+        size_t count = n_local * test_embd * test_ff;
+        
+        // Verify first element of each local expert
+        for (int local_expert = 0; local_expert < n_local; local_expert++) {
+            int global_expert = low + local_expert;
+            float expected = global_expert * 1000.0f;  // First element of expert
+            float actual = expert_weights[offset + local_expert * test_embd * test_ff];
+            assert(actual == expected);
+        }
+    }
+    
+    // Simulate output accumulation
+    // MUL_MAT_ID output for 8 tokens with hidden size 64
+    const int n_tokens = 8;
+    std::vector<float> accumulated_output(n_tokens * test_embd, 0.0f);
+    
+    // Each endpoint contributes its experts' outputs
+    for (size_t ep = 0; ep < vram.size(); ep++) {
+        auto [low, high] = rpc_split_get_expert_range(ep, vram.size(), n_expert, vram);
+        
+        // Simulate partial results from this endpoint
+        std::vector<float> partial_output(n_tokens * test_embd, 0.0f);
+        for (int t = 0; t < n_tokens; t++) {
+            auto [e1, e2] = token_experts[t];
+            // Add contribution if expert is on this endpoint
+            if (e1 >= low && e1 < high) {
+                for (int i = 0; i < test_embd; i++) {
+                    partial_output[t * test_embd + i] += e1 + 1;  // Expert contribution
+                }
+            }
+            if (e2 >= low && e2 < high) {
+                for (int i = 0; i < test_embd; i++) {
+                    partial_output[t * test_embd + i] += e2 + 1;
+                }
+            }
+        }
+        
+        // Accumulate into final output
+        for (size_t i = 0; i < accumulated_output.size(); i++) {
+            accumulated_output[i] += partial_output[i];
+        }
+    }
+    
+    // Verify accumulated results
+    for (int t = 0; t < n_tokens; t++) {
+        auto [e1, e2] = token_experts[t];
+        float expected = (e1 + 1) + (e2 + 1);  // Sum of both experts' contributions
+        float actual = accumulated_output[t * test_embd];  // Check first element
+        assert(actual == expected);
+    }
+    
+    printf("  Expert activations: ");
+    for (int e = 0; e < n_expert; e++) {
+        printf("E%d=%d ", e, expert_activations[e]);
+    }
+    printf("\n");
+    
+    printf("  Load balance verified, data distribution correct\n");
+    printf("PASS\n");
 }
 
-// Additional tests that can be run with the compiled library
-// These test the actual RPC split buffer API
-
-#ifdef TEST_WITH_LIBRARY
-#include "ggml-rpc.h"
-
-// Test 11: Split buffer type creation (requires no active servers, just API test)
-bool test_split_buffer_type_api() {
-    printf("Testing split buffer type API... ");
+void test_moe_expert_migration_scenario() {
+    printf("Testing expert migration scenario (unbalanced load)...\n");
     
-    // These endpoints don't need to be valid for API testing
-    const char * endpoints[] = {"127.0.0.1:50052", "127.0.0.1:50053", nullptr};
-    uint32_t devices[] = {0, 0};
-    float tensor_split[] = {0.6f, 0.4f};
+    // Scenario: One endpoint has 2x VRAM, gets more experts
+    std::vector<size_t> vram = {16ULL * 1024 * 1024 * 1024, 8ULL * 1024 * 1024 * 1024};
+    const int n_expert = 8;
     
-    // This will fail to connect but should not crash
-    // Just verify the API exists and is callable
-    auto buft = ggml_backend_rpc_split_buffer_type(endpoints, devices, tensor_split, 2);
+    // With 2:1 VRAM ratio, expect ~5:3 or 6:2 expert split
+    auto [low0, high0] = rpc_split_get_expert_range(0, vram.size(), n_expert, vram);
+    auto [low1, high1] = rpc_split_get_expert_range(1, vram.size(), n_expert, vram);
     
-    // We expect nullptr since endpoints aren't available
-    // But if servers were running, this should succeed
-    printf("(returned %s) ", buft ? "buft" : "nullptr");
+    int experts_ep0 = high0 - low0;
+    int experts_ep1 = high1 - low1;
     
-    TEST_PASS();
+    printf("  Endpoint 0 (16GB): %d experts (%d-%d)\n", experts_ep0, low0, high0-1);
+    printf("  Endpoint 1 (8GB): %d experts (%d-%d)\n", experts_ep1, low1, high1-1);
+    
+    // Endpoint with more VRAM should have more experts
+    assert(experts_ep0 > experts_ep1);
+    
+    // Total should still be all experts
+    assert(experts_ep0 + experts_ep1 == n_expert);
+    
+    // Simulate hot expert scenario - expert 0 is activated 80% of time
+    // In a real system, this would trigger migration consideration
+    std::vector<int> activation_counts(n_expert, 0);
+    const int n_iterations = 1000;
+    
+    for (int i = 0; i < n_iterations; i++) {
+        // 80% of time, use expert 0
+        if (rand() % 100 < 80) {
+            activation_counts[0]++;
+        } else {
+            // 20% distributed among others
+            activation_counts[1 + rand() % (n_expert - 1)]++;
+        }
+    }
+    
+    // Expert 0 should have significantly more activations
+    assert(activation_counts[0] > activation_counts[1] * 3);
+    
+    printf("  Hot expert detection: E0=%d activations (%.1f%%)\n", 
+           activation_counts[0], 100.0f * activation_counts[0] / n_iterations);
+    
+    printf("PASS\n");
 }
 
-// Test 12: Check if buffer type is RPC split
-bool test_buft_is_rpc_split() {
-    printf("Testing ggml_backend_buft_is_rpc_split... ");
+void test_moe_data_integrity() {
+    printf("Testing MoE data integrity through split/reconstruct...\n");
     
-    // nullptr should return false
-    TEST_ASSERT(!ggml_backend_buft_is_rpc_split(nullptr));
+    // Create expert tensor data
+    const int n_expert = 4;
+    const int n_embd = 32;
+    const int n_ff = 64;
+    std::vector<float> original_data(n_expert * n_embd * n_ff);
     
-    TEST_PASS();
+    // Fill with deterministic pattern
+    for (size_t i = 0; i < original_data.size(); i++) {
+        original_data[i] = std::sin(i * 0.01f) * 100.0f;
+    }
+    
+    // Split across 2 endpoints (2 experts each)
+    std::vector<size_t> vram = {8ULL * 1024 * 1024 * 1024, 8ULL * 1024 * 1024 * 1024};
+    std::vector<std::vector<float>> endpoint_data(2);
+    
+    for (size_t ep = 0; ep < vram.size(); ep++) {
+        auto [low, high] = rpc_split_get_expert_range(ep, vram.size(), n_expert, vram);
+        size_t offset = low * n_embd * n_ff;
+        size_t count = (high - low) * n_embd * n_ff;
+        
+        endpoint_data[ep].resize(count);
+        std::copy(original_data.begin() + offset, 
+                  original_data.begin() + offset + count,
+                  endpoint_data[ep].begin());
+    }
+    
+    // Reconstruct by gathering from endpoints
+    std::vector<float> reconstructed(original_data.size());
+    for (size_t ep = 0; ep < vram.size(); ep++) {
+        auto [low, high] = rpc_split_get_expert_range(ep, vram.size(), n_expert, vram);
+        size_t offset = low * n_embd * n_ff;
+        
+        std::copy(endpoint_data[ep].begin(), 
+                  endpoint_data[ep].end(),
+                  reconstructed.begin() + offset);
+    }
+    
+    // Verify exact match
+    for (size_t i = 0; i < original_data.size(); i++) {
+        assert(original_data[i] == reconstructed[i]);
+    }
+    
+    printf("  %zu floats split and reconstructed correctly\n", original_data.size());
+    printf("PASS\n");
 }
-#endif
-
-
