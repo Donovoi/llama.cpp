@@ -644,6 +644,78 @@ static void add_rpc_devices(const std::string & servers) {
     }
 }
 
+// Create RPC split buffer type for distributing MoE expert tensors across endpoints
+// Format: "endpoint1:port1,endpoint2:port2,...|split1,split2,..."
+// Example: "192.168.1.10:50052,192.168.1.11:50052|0.6,0.4"
+static ggml_backend_buffer_type_t create_rpc_expert_split_buffer(const std::string & value) {
+    // Parse endpoints and splits
+    auto parts = string_split<std::string>(value, '|');
+    if (parts.size() != 2) {
+        throw std::invalid_argument("invalid format: expected 'endpoints|splits'");
+    }
+    
+    auto endpoints = string_split<std::string>(parts[0], ',');
+    auto splits = string_split<std::string>(parts[1], ',');
+    
+    if (endpoints.empty()) {
+        throw std::invalid_argument("no RPC endpoints specified");
+    }
+    if (endpoints.size() != splits.size()) {
+        throw std::invalid_argument("number of endpoints must match number of splits");
+    }
+    if (endpoints.size() > 16) {
+        throw std::invalid_argument("maximum 16 RPC endpoints supported");
+    }
+    
+    // Get the RPC registry and function
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("failed to find RPC backend");
+    }
+    
+    typedef ggml_backend_buffer_type_t (*ggml_backend_rpc_split_buffer_type_t)(
+        const char ** endpoints, const uint32_t * devices, const float * tensor_split, int n_endpoints);
+    
+    auto split_buft_fn = (ggml_backend_rpc_split_buffer_type_t) 
+        ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_split_buffer_type");
+    if (!split_buft_fn) {
+        throw std::invalid_argument("failed to find RPC split buffer function");
+    }
+    
+    // Prepare arrays
+    static std::vector<std::string> endpoint_storage;
+    static std::vector<const char*> endpoint_ptrs;
+    static std::vector<uint32_t> devices;
+    static std::vector<float> tensor_split;
+    
+    endpoint_storage = endpoints;
+    endpoint_ptrs.clear();
+    devices.clear();
+    tensor_split.clear();
+    
+    for (const auto & ep : endpoint_storage) {
+        endpoint_ptrs.push_back(ep.c_str());
+    }
+    endpoint_ptrs.push_back(nullptr);  // null terminator
+    
+    float total = 0.0f;
+    for (const auto & s : splits) {
+        float f = std::stof(s);
+        tensor_split.push_back(f);
+        devices.push_back(0);  // device 0 on each endpoint
+        total += f;
+    }
+    
+    // Normalize splits to sum to 1
+    if (total > 0.0f) {
+        for (auto & s : tensor_split) {
+            s /= total;
+        }
+    }
+    
+    return split_buft_fn(endpoint_ptrs.data(), devices.data(), tensor_split.data(), (int)endpoints.size());
+}
+
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
@@ -1841,6 +1913,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 GGML_UNUSED(params);
             }
         ).set_env("LLAMA_ARG_RPC"));
+        add_opt(common_arg(
+            {"--rpc-expert-split"}, "CONFIG",
+            "distribute MoE expert tensors across RPC endpoints.\n"
+            "Format: 'endpoint1:port,endpoint2:port,...|split1,split2,...'\n"
+            "Example: '192.168.1.10:50052,192.168.1.11:50052|0.6,0.4'\n"
+            "Splits are proportional (will be normalized to sum to 1)",
+            [](common_params & params, const std::string & value) {
+                auto buft = create_rpc_expert_split_buffer(value);
+                if (!buft) {
+                    throw std::invalid_argument("failed to create RPC expert split buffer");
+                }
+                // Add override for expert tensors to use the split buffer
+                static std::string expert_pattern = LLM_FFN_EXPS_REGEX;
+                params.tensor_buft_overrides.push_back({expert_pattern.c_str(), buft});
+            }
+        ).set_env("LLAMA_ARG_RPC_EXPERT_SPLIT"));
     }
     add_opt(common_arg(
         {"--mlock"},
