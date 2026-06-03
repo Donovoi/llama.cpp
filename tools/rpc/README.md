@@ -187,7 +187,21 @@ and record benchmark-specific client environment variables such as
 `GGML_RPC_TCP_BUFFER_SIZE` or `GGML_RPC_CACHE_MIN_SIZE`. Use `--llama-bench` when
 both cases should use the same local client binary, or `--base-llama-bench` and
 `--patch-llama-bench` when you want an end-to-end base-client/base-server versus
-patch-client/patch-server comparison.
+patch-client/patch-server comparison. For warmed-cache or one-sided experiments,
+use `--only base` or `--only patch` with the matching endpoint and binary.
+
+When benchmarking CUDA RPC servers across different GPU generations, build for
+the remote GPUs as well as the local client GPU. For example, an RTX 3070 server
+and RTX 4060 client need both architectures:
+
+```bash
+cmake -B build-cuda -DGGML_CUDA=ON -DGGML_RPC=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="86-real;89-real"
+```
+
+If the server log reports `no kernel image is available for execution on the
+device`, rebuild with the missing remote architecture before comparing RPC
+throughput.
 
 ### Troubleshooting
 
