@@ -95,6 +95,18 @@ $ bin/rpc-server -c
 
 By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory and can be controlled via the `LLAMA_CACHE` environment variable.
 
+Only tensors larger than 10 MiB are hashed and stored by default. Workloads with
+many smaller tensors can lower that threshold on both the client and server:
+
+```bash
+$ GGML_RPC_CACHE_MIN_SIZE=1048576 bin/rpc-server -c
+$ GGML_RPC_CACHE_MIN_SIZE=1048576 llama-cli -m model.gguf -ngl 99 --rpc 192.168.88.10:50052
+```
+
+The value is in bytes. Lower values can reduce warm-cache model loading time at
+the cost of more hash probes, hashing work, and cache files, so benchmark the
+threshold with your model and network.
+
 ### RDMA transport
 
 On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX), the RPC backend can use RDMA instead of TCP for lower latency and higher throughput. The transport is negotiated automatically -- no changes to command-line usage are required.
